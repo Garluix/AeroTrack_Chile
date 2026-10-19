@@ -1,0 +1,79 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: aerotrack-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - aerotrack-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aerotrack-backend
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - HOST=0.0.0.0
+      - REDIS_URL=redis://redis:6379
+      - REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX:-aerotrack:}
+      - STATE_TTL_SECONDS=${STATE_TTL_SECONDS:-120}
+      - TRAIL_MAX_POINTS=${TRAIL_MAX_POINTS:-150}
+      - OPENSKY_BASE_URL=${OPENSKY_BASE_URL:-https://opensky-network.org/api/states/all}
+      - OPENSKY_USERNAME=${OPENSKY_USERNAME:-}
+      - OPENSKY_PASSWORD=${OPENSKY_PASSWORD:-}
+      - ADSBFI_BASE_URL=${ADSBFI_BASE_URL:-https://opendata.adsb.fi/api/v2}
+      - POLLING_INTERVAL_MS=${POLLING_INTERVAL_MS:-6000}
+      - HTTP_TIMEOUT_MS=${HTTP_TIMEOUT_MS:-5000}
+      - MAX_HTTP_RETRIES=${MAX_HTTP_RETRIES:-3}
+      - ENABLE_HYBRID_SYNTHETIC_TRAFFIC=${ENABLE_HYBRID_SYNTHETIC_TRAFFIC:-false}
+      - SYNTHETIC_AIRCRAFT_COUNT=${SYNTHETIC_AIRCRAFT_COUNT:-0}
+      - DEFAULT_LAMIN=${DEFAULT_LAMIN:--56.5}
+      - DEFAULT_LOMIN=${DEFAULT_LOMIN:--109.5}
+      - DEFAULT_LAMAX=${DEFAULT_LAMAX:--17.5}
+      - DEFAULT_LOMAX=${DEFAULT_LOMAX:--66.0}
+      - SPATIAL_GEOHASH_PRECISION=${SPATIAL_GEOHASH_PRECISION:-4}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aerotrack-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:4000/ws}
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:4000/api}
+        VITE_INITIAL_LAT: ${VITE_INITIAL_LAT:--33.4489}
+        VITE_INITIAL_LON: ${VITE_INITIAL_LON:--70.6693}
+        VITE_INITIAL_ZOOM: ${VITE_INITIAL_ZOOM:-6.0}
+    container_name: aerotrack-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    networks:
+      - aerotrack-net
+
+networks:
+  aerotrack-net:
+    driver: bridge

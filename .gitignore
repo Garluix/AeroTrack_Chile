@@ -6,6 +6,8 @@ node_modules/
 dist/
 **/dist/
 build/
+*.tsbuildinfo
+**/*.tsbuildinfo
 
 # Environment variables (keep .env.example)
 .env
