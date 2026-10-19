@@ -1,0 +1,346 @@
+import { KinematicAircraft } from '../types/telemetry';
+
+const EARTH_RADIUS_M = 6371000.0;
+const DEG_TO_RAD = Math.PI / 180.0;
+const RAD_TO_DEG = 180.0 / Math.PI;
+
+/**
+ * Projects estimated position P_t on the Earth's sphere given:
+ * - Initial coordinate P_0 = (lat0, lon0) in degrees
+ * - Ground speed v (m/s)
+ * - True track angle theta (degrees clockwise from true north)
+ * - Elapsed time dtSec (seconds)
+ *
+ * Uses exact spherical trigonometry (Great Circle forward solution):
+ *   delta = (v * dt) / R
+ *   phi_t = asin(sin(phi_0)*cos(delta) + cos(phi_0)*sin(delta)*cos(theta))
+ *   lambda_t = lambda_0 + atan2(sin(theta)*sin(delta)*cos(phi_0), cos(delta) - sin(phi_0)*sin(phi_t))
+ */
+export function projectGreatCirclePosition(
+  lat0: number,
+  lon0: number,
+  velocityMs: number,
+  trueTrackDeg: number,
+  dtSec: number
+): [number, number] {
+  if (velocityMs <= 0.1 || dtSec <= 0) {
+    return [lat0, lon0];
+  }
+
+  // Clamp dead-reckoning horizon to 25 seconds to prevent runaway extrapolation on lost contact
+  const clampedDt = Math.min(25.0, Math.max(0.0, dtSec));
+  const distanceMeters = velocityMs * clampedDt;
+  const angularDistance = distanceMeters / EARTH_RADIUS_M;
+
+  const phi0 = lat0 * DEG_TO_RAD;
+  const lambda0 = lon0 * DEG_TO_RAD;
+  const theta = trueTrackDeg * DEG_TO_RAD;
+
+  const sinPhi0 = Math.sin(phi0);
+  const cosPhi0 = Math.cos(phi0);
+  const sinDelta = Math.sin(angularDistance);
+  const cosDelta = Math.cos(angularDistance);
+
+  const sinPhiT = sinPhi0 * cosDelta + cosPhi0 * sinDelta * Math.cos(theta);
+  const phiT = Math.asin(Math.max(-1.0, Math.min(1.0, sinPhiT)));
+
+  const y = Math.sin(theta) * sinDelta * cosPhi0;
+  const x = cosDelta - sinPhi0 * sinPhiT;
+  const lambdaT = lambda0 + Math.atan2(y, x);
+
+  const latT = phiT * RAD_TO_DEG;
+  const lonT = (((lambdaT * RAD_TO_DEG) + 540.0) % 360.0) - 180.0;
+
+  return [latT, lonT];
+}
+
+/**
+ * Spherical Linear Interpolation (Slerp) between two geographic coordinates on the unit sphere.
+ * Ensures smooth geodesic transitions without Euclidean distortion at high latitudes (e.g. FIR SCCF Magallanes).
+ */
+export function slerpGeoPosition(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+  t: number
+): [number, number] {
+  const alpha = Math.max(0.0, Math.min(1.0, t));
+  if (alpha <= 0.0001) return [lat1, lon1];
+  if (alpha >= 0.9999) return [lat2, lon2];
+
+  const phi1 = lat1 * DEG_TO_RAD;
+  const lam1 = lon1 * DEG_TO_RAD;
+  const phi2 = lat2 * DEG_TO_RAD;
+  const lam2 = lon2 * DEG_TO_RAD;
+
+  // Convert spherical (lat, lon) to 3D unit vectors
+  const x1 = Math.cos(phi1) * Math.cos(lam1);
+  const y1 = Math.cos(phi1) * Math.sin(lam1);
+  const z1 = Math.sin(phi1);
+
+  const x2 = Math.cos(phi2) * Math.cos(lam2);
+  const y2 = Math.cos(phi2) * Math.sin(lam2);
+  const z2 = Math.sin(phi2);
+
+  const dot = Math.max(-1.0, Math.min(1.0, x1 * x2 + y1 * y2 + z1 * z2));
+  const omega = Math.acos(dot);
+
+  if (omega < 1e-6) {
+    return [
+      lat1 + (lat2 - lat1) * alpha,
+      lon1 + (lon2 - lon1) * alpha,
+    ];
+  }
+
+  const sinOmega = Math.sin(omega);
+  const w1 = Math.sin((1.0 - alpha) * omega) / sinOmega;
+  const w2 = Math.sin(alpha * omega) / sinOmega;
+
+  const x = w1 * x1 + w2 * x2;
+  const y = w1 * y1 + w2 * y2;
+  const z = w1 * z1 + w2 * z2;
+
+  const lat = Math.atan2(z, Math.sqrt(x * x + y * y)) * RAD_TO_DEG;
+  const lon = Math.atan2(y, x) * RAD_TO_DEG;
+
+  return [lat, lon];
+}
+
+/**
+ * Shortest-arc angular interpolation for aircraft heading [0, 360).
+ */
+export function lerpAngleDeg(currentDeg: number, targetDeg: number, alpha: number): number {
+  const diff = ((((targetDeg - currentDeg) % 360) + 540) % 360) - 180;
+  return (((currentDeg + diff * alpha) % 360) + 360) % 360;
+}
+
+/**
+ * Advances a single KinematicAircraft in-place for the current animation frame:
+ * 1. Projects target coordinate P_t from the last authoritative state P_0 using Great Circle kinematics.
+ * 2. Applies exponential error decay (1 - exp(-lambda * frameDt)) via Spherical Linear Interpolation (Slerp)
+ *    from the current rendered coordinate toward P_t so the entity NEVER teleports when a new WS packet arrives.
+ */
+export function stepAircraftKinematics(
+  ac: KinematicAircraft,
+  nowMs: number,
+  frameDtSec: number
+): void {
+  if (ac.on_ground || ac.velocity < 1.0) {
+    const blend = 1.0 - Math.exp(-6.0 * frameDtSec);
+    const [nextLat, nextLon] = slerpGeoPosition(
+      ac.renderLat,
+      ac.renderLon,
+      ac.anchorLat,
+      ac.anchorLon,
+      blend
+    );
+    ac.renderLat = nextLat;
+    ac.renderLon = nextLon;
+    ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, blend);
+    return;
+  }
+
+  // Time elapsed since the authoritative anchor state was captured
+  const elapsedSinceAnchorSec = Math.max(0, (nowMs - ac.anchorTimestampMs) / 1000.0);
+
+  // Project ideal Dead Reckoning position along the Great Circle
+  const [projectedLat, projectedLon] = projectGreatCirclePosition(
+    ac.anchorLat,
+    ac.anchorLon,
+    ac.velocity,
+    ac.true_track,
+    elapsedSinceAnchorSec
+  );
+
+  // Also advance current render position forward along its current renderTrack by frameDtSec
+  const [steppedRenderLat, steppedRenderLon] = projectGreatCirclePosition(
+    ac.renderLat,
+    ac.renderLon,
+    ac.velocity,
+    ac.renderTrack,
+    frameDtSec
+  );
+
+  // Exponential error decay factor (lambda = 3.2 s^-1 provides silky convergence over ~0.8s without snapping)
+  const errorDecayAlpha = 1.0 - Math.exp(-3.2 * frameDtSec);
+
+  const [smoothedLat, smoothedLon] = slerpGeoPosition(
+    steppedRenderLat,
+    steppedRenderLon,
+    projectedLat,
+    projectedLon,
+    errorDecayAlpha
+  );
+
+  ac.renderLat = smoothedLat;
+  ac.renderLon = smoothedLon;
+  ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, 1.0 - Math.exp(-5.0 * frameDtSec));
+
+  const targetAlt = Math.max(0, ac.anchorAlt + ac.vertical_rate * elapsedSinceAnchorSec);
+  ac.renderAlt = ac.renderAlt + (targetAlt - ac.renderAlt) * errorDecayAlpha;
+}
+
+/**
+ * Emergency Squawk codes per ICAO Annex 10:
+ * - 7500: Unlawful Interference (Hijacking)
+ * - 7600: Radio Communications Failure (NORDO)
+ * - 7700: General / Distress Emergency
+ */
+export function isEmergencySquawk(squawk: string | null | undefined): boolean {
+  return squawk === '7500' || squawk === '7600' || squawk === '7700';
+}
+
+export function getSquawkAlertInfo(squawk: string | null | undefined): {
+  isEmergency: boolean;
+  code: string;
+  label: string;
+  severity: 'critical' | 'warning' | 'normal';
+} {
+  switch (squawk) {
+    case '7700':
+      return {
+        isEmergency: true,
+        code: '7700',
+        label: 'EMERGENCIA GENERAL (MAYDAY)',
+        severity: 'critical',
+      };
+    case '7600':
+      return {
+        isEmergency: true,
+        code: '7600',
+        label: 'FALLA DE COMUNICACIONES (NORDO)',
+        severity: 'warning',
+      };
+    case '7500':
+      return {
+        isEmergency: true,
+        code: '7500',
+        label: 'INTERFERENCIA ILÍCITA (HIJACK)',
+        severity: 'critical',
+      };
+    default:
+      return {
+        isEmergency: false,
+        code: squawk || '----',
+        label: 'OPERACIÓN NORMAL',
+        severity: 'normal',
+      };
+  }
+}
+
+/**
+ * Maps altitude (in meters) to an RGBA tuple [R, G, B, A] for aircraft icons and breadcrumb trails:
+ * - Ground / < 1,500m: Emerald (#10b981)
+ * - 1,500m - 6,000m: Cyan (#06b6d4)
+ * - 6,000m - 10,000m: Sky / Indigo (#38bdf8 -> #818cf8)
+ * - > 10,000m (Cruise FL330+): Amber / Violet-Magenta (#f59e0b -> #ec4899)
+ */
+export function getAltitudeColorRGBA(
+  altitudeMeters: number,
+  squawk?: string | null,
+  isSelected?: boolean,
+  pulsePhase = 1.0
+): [number, number, number, number] {
+  if (isEmergencySquawk(squawk)) {
+    const intensity = Math.round(195 + 60 * pulsePhase);
+    return [255, Math.round(45 * (1 - pulsePhase)), Math.round(65 * (1 - pulsePhase)), intensity];
+  }
+
+  if (isSelected) {
+    return [250, 204, 21, 255]; // Tactical gold highlight (#facc15)
+  }
+
+  const clamped = Math.max(0, Math.min(13000, altitudeMeters));
+  const ratio = clamped / 13000;
+
+  if (ratio < 0.25) {
+    const t = ratio / 0.25;
+    return [
+      Math.round(16 + (6 - 16) * t),
+      Math.round(185 + (182 - 185) * t),
+      Math.round(129 + (212 - 129) * t),
+      245,
+    ];
+  } else if (ratio < 0.6) {
+    const t = (ratio - 0.25) / 0.35;
+    return [
+      Math.round(6 + (56 - 6) * t),
+      Math.round(182 + (189 - 182) * t),
+      Math.round(212 + (248 - 212) * t),
+      245,
+    ];
+  } else if (ratio < 0.85) {
+    const t = (ratio - 0.6) / 0.25;
+    return [
+      Math.round(56 + (168 - 56) * t),
+      Math.round(189 + (85 - 189) * t),
+      Math.round(248 + (247 - 248) * t),
+      250,
+    ];
+  } else {
+    const t = (ratio - 0.85) / 0.15;
+    return [
+      Math.round(168 + (244 - 168) * t),
+      Math.round(85 + (114 - 85) * t),
+      Math.round(247 + (182 - 247) * t),
+      255,
+    ];
+  }
+}
+
+// Aviation Unit Conversions
+export const metersToFeet = (m: number): number => Math.round(m * 3.28084);
+export const msToKnots = (ms: number): number => Math.round(ms * 1.94384);
+export const msToKmh = (ms: number): number => Math.round(ms * 3.6);
+export const msToFeetPerMin = (ms: number): number => Math.round(ms * 196.85);
+
+/**
+ * Estimates Mach number based on ISA speed of sound at altitude.
+ */
+export function msToMach(velocityMs: number, altitudeMeters: number): number {
+  const tempKelvin = Math.max(216.65, 288.15 - 0.0065 * Math.min(11000, altitudeMeters));
+  const speedOfSound = Math.sqrt(1.4 * 287.05 * tempKelvin);
+  return Number((velocityMs / speedOfSound).toFixed(2));
+}
+
+/**
+ * Generates a high-DPI aircraft icon atlas PNG data URL rendered from an exact SVG vector Path2D
+ * centered at pivot (64, 64) in a 128x128 coordinate space, oriented pointing North (0 deg)
+ * so Deck.gl IconLayer in Google Chrome decodes it natively via createImageBitmap and rotates
+ * around its exact center pivot in sync with `true_track`.
+ */
+export function createAircraftIconAtlasDataUrl(): string {
+  if (typeof document !== 'undefined') {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.clearRect(0, 0, 128, 128);
+      ctx.save();
+      ctx.translate(64, 64);
+      const path = new Path2D(
+        'M 0 -52 C 5 -42, 7 -28, 7 -12 L 48 12 L 48 20 L 7 8 L 6 34 L 22 45 L 22 51 L 0 44 L -22 51 L -22 45 L -6 34 L -7 8 L -48 20 L -48 12 L -7 -12 C -7 -28, -5 -42, 0 -52 Z'
+      );
+      ctx.fillStyle = '#ffffff';
+      ctx.fill(path);
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineJoin = 'round';
+      ctx.stroke(path);
+      ctx.restore();
+      return canvas.toDataURL('image/png');
+    }
+  }
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+    <g transform="translate(64,64)">
+      <path
+        d="M 0 -52 C 5 -42, 7 -28, 7 -12 L 48 12 L 48 20 L 7 8 L 6 34 L 22 45 L 22 51 L 0 44 L -22 51 L -22 45 L -6 34 L -7 8 L -48 20 L -48 12 L -7 -12 C -7 -28, -5 -42, 0 -52 Z"
+        fill="#ffffff"
+      />
+    </g>
+  </svg>`;
+  return `data:image/svg+xml;base64,${btoa(svg)}`;
+}
