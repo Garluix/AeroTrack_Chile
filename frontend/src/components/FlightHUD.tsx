@@ -48,6 +48,7 @@ const API_BASE = resolveApiBase();
 
 /**
  * Vector SVG silhouette placeholder tailored to the aircraft category:
+ * - 'helicopter' (Ala Rotatoria: Bell 206/407/412, Airbus H125/H135/H145, UH-60, AW139, Robinson R44)
  * - 'twin-jet' (Jet Bimotor: A320, A321neo, B737, B787 Dreamliner)
  * - 'quad-jet' (Cuatrimotor: B747, A340, A380, BAe 146)
  * - 'turboprop' (Turbohélice / Pistón: ATR 72, Dash 8, King Air, Cessna, C-130)
@@ -58,7 +59,9 @@ const AirframeCategorySilhouette: React.FC<{
   model: string;
 }> = ({ category, code, model }) => {
   const categoryLabel =
-    category === 'quad-jet'
+    category === 'helicopter'
+      ? 'SILUETA TÁCTICA · ALA ROTATORIA / HELICÓPTERO'
+      : category === 'quad-jet'
       ? 'SILUETA TÁCTICA · CUATRIMOTOR PESADO'
       : category === 'turboprop'
       ? 'SILUETA TÁCTICA · TURBOHÉLICE / REGIONAL'
@@ -86,7 +89,29 @@ const AirframeCategorySilhouette: React.FC<{
       </div>
 
       {/* Category-specific vector blueprint SVG */}
-      {category === 'quad-jet' ? (
+      {category === 'helicopter' ? (
+        <svg viewBox="0 0 260 120" className="w-44 h-24 text-emerald-400/85 drop-shadow-[0_0_10px_rgba(16,185,129,0.3)]">
+          {/* Landing skids */}
+          <line x1="112" y1="28" x2="112" y2="62" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+          <line x1="148" y1="28" x2="148" y2="62" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+          <line x1="112" y1="38" x2="122" y2="38" stroke="currentColor" strokeWidth="2" />
+          <line x1="138" y1="38" x2="148" y2="38" stroke="currentColor" strokeWidth="2" />
+          <line x1="112" y1="54" x2="122" y2="54" stroke="currentColor" strokeWidth="2" />
+          <line x1="138" y1="54" x2="148" y2="54" stroke="currentColor" strokeWidth="2" />
+          {/* Cabin + tail boom + stabilizer */}
+          <path
+            d="M130 18 C140 18 143 32 142 48 C141 58 136 66 133 70 L132 98 L146 98 L146 103 L132 103 L132 109 L128 109 L128 103 L114 103 L114 98 L128 98 L127 70 C124 66 119 58 118 48 C117 32 120 18 130 18 Z"
+            fill="rgba(16,185,129,0.18)"
+            stroke="currentColor"
+            strokeWidth="2"
+          />
+          {/* Main rotor disc & 4-blade cross */}
+          <circle cx="130" cy="45" r="38" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3" />
+          <line x1="101" y1="16" x2="159" y2="74" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" />
+          <line x1="159" y1="16" x2="101" y2="74" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" />
+          <circle cx="130" cy="45" r="5" fill="currentColor" />
+        </svg>
+      ) : category === 'quad-jet' ? (
         <svg viewBox="0 0 260 120" className="w-44 h-24 text-cyan-400/80 drop-shadow-[0_0_10px_rgba(6,182,212,0.3)]">
           <path
             d="M130 8 C135 18 137 32 137 46 L232 76 L232 84 L137 68 L136 96 L166 108 L166 114 L130 106 L94 114 L94 108 L124 96 L123 68 L28 84 L28 76 L123 46 C123 32 125 18 130 8 Z"
@@ -202,11 +227,13 @@ export const FlightHUD: React.FC<FlightHUDProps> = ({ onSimulateSquawk }) => {
               photoUrl: p?.thumbnail_large?.src || p?.thumbnail?.src || p?.src || null,
               photographer: p?.photographer || null,
               photoLink: p?.link || null,
-              aircraftModel: ac?.aircraft_model || 'Aeronave Comercial ADS-B',
-              aircraftCode: ac?.aircraft_code || 'ADSB',
+              aircraftModel:
+                ac?.aircraft_model ||
+                (ac?.isHelicopter ? 'Helicóptero ADS-B' : 'Aeronave Comercial ADS-B'),
+              aircraftCode: ac?.aircraft_code || (ac?.isHelicopter ? 'HELI' : 'ADSB'),
               registration: ac?.registration || hex.toUpperCase(),
               operator: null,
-              category: 'twin-jet',
+              category: ac?.isHelicopter ? 'helicopter' : 'twin-jet',
             });
           }
         }
@@ -242,11 +269,16 @@ export const FlightHUD: React.FC<FlightHUDProps> = ({ onSimulateSquawk }) => {
   const squawkInfo = getSquawkAlertInfo(ac.squawk);
 
   const displayModel =
-    photoMeta?.aircraftModel || ac.aircraft_model || 'Aeronave Comercial ADS-B';
-  const displayCode = photoMeta?.aircraftCode || ac.aircraft_code || 'ADSB';
+    photoMeta?.aircraftModel ||
+    ac.aircraft_model ||
+    (ac.isHelicopter ? 'Helicóptero ADS-B' : 'Aeronave Comercial ADS-B');
+  const displayCode =
+    photoMeta?.aircraftCode || ac.aircraft_code || (ac.isHelicopter ? 'HELI' : 'ADSB');
   const displayReg =
     photoMeta?.registration || ac.registration || ac.icao24.toUpperCase();
-  const displayCategory: AirframeCategory = photoMeta?.category || 'twin-jet';
+  const displayCategory: AirframeCategory = ac.isHelicopter
+    ? 'helicopter'
+    : photoMeta?.category || 'twin-jet';
 
   // Build SVG path for historical altitude profile
   const profilePoints = [...trail.map((t) => t.alt), ac.renderAlt];
@@ -354,6 +386,11 @@ export const FlightHUD: React.FC<FlightHUDProps> = ({ onSimulateSquawk }) => {
             <span className="px-2 py-0.5 text-[11px] font-mono font-semibold rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
               {ac.fir}
             </span>
+            {ac.isHelicopter && (
+              <span className="px-2 py-0.5 text-[11px] font-mono font-semibold rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                HELICÓPTERO
+              </span>
+            )}
             <span className="px-2 py-0.5 text-[11px] font-mono rounded-md bg-slate-800/90 text-amber-300 border border-amber-500/30">
               {flightLevel}
             </span>

@@ -41,6 +41,15 @@ const AIRCRAFT_ICON_MAPPING = {
     anchorY: 64, // Exact center pivot Y
     mask: true,
   },
+  helicopter: {
+    x: 128,
+    y: 0,
+    width: 128,
+    height: 128,
+    anchorX: 64, // Exact center pivot X
+    anchorY: 64, // Exact center pivot Y
+    mask: true,
+  },
 };
 
 function hexToRgba(hex: string, alpha: number): [number, number, number, number] {
@@ -453,65 +462,70 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
           },
         }),
 
-      // 4. High-Volume WebGL Instanced Aircraft IconLayer driven directly by Float32Array & Uint8Array buffers
-      new IconLayer({
-        id: 'aircraft-kinematic-icon-layer',
-        data: {
-          length: buffers.count,
-          attributes: {
-            getPosition: {
-              value: buffers.positions.subarray(0, buffers.count * 3),
-              size: 3,
-            },
-            getAngle: {
-              value: buffers.angles.subarray(0, buffers.count),
-              size: 1,
-            },
-            getSize: {
-              value: buffers.sizes.subarray(0, buffers.count),
-              size: 1,
-            },
-            getColor: {
-              value: buffers.colors.subarray(0, buffers.count * 4),
-              size: 4,
+        // 4. High-Volume WebGL Instanced Aircraft & Helicopter IconLayer driven directly by Float32Array & Uint8Array buffers
+        new IconLayer({
+          id: 'aircraft-kinematic-icon-layer',
+          data: {
+            length: buffers.count,
+            attributes: {
+              getPosition: {
+                value: buffers.positions.subarray(0, buffers.count * 3),
+                size: 3,
+              },
+              getAngle: {
+                value: buffers.angles.subarray(0, buffers.count),
+                size: 1,
+              },
+              getSize: {
+                value: buffers.sizes.subarray(0, buffers.count),
+                size: 1,
+              },
+              getColor: {
+                value: buffers.colors.subarray(0, buffers.count * 4),
+                size: 4,
+              },
+              instanceIconDefs: {
+                value: buffers.iconDefs.subarray(0, buffers.count * 7),
+                size: 7,
+              },
             },
           },
-        },
-        pickable: true,
-        iconAtlas: AIRCRAFT_ICON_ATLAS,
-        iconMapping: AIRCRAFT_ICON_MAPPING,
-        getIcon: 'aircraft' as unknown as () => string,
-        sizeScale: 1,
-        sizeUnits: 'pixels',
-        sizeMinPixels: currentZoomRef.current < 4.0 ? 12 : 18,
-        sizeMaxPixels: 38,
-        billboard: false,
-        onHover: (info: PickingInfo) => {
-          const picked =
-            typeof info.index === 'number' && info.index >= 0
-              ? aircraftList[info.index]
-              : undefined;
-          if (picked) {
-            setHoveredAircraft({
-              x: info.x,
-              y: info.y,
-              aircraft: picked,
-            });
-          } else {
-            setHoveredAircraft(null);
-          }
-        },
-        onClick: (info: PickingInfo) => {
-          const picked =
-            typeof info.index === 'number' && info.index >= 0
-              ? aircraftList[info.index]
-              : undefined;
-          if (picked) {
-            setSelectedIcao24(picked.icao24);
-          }
-        },
-      }),
-    ];
+          pickable: true,
+          iconAtlas: AIRCRAFT_ICON_ATLAS,
+          iconMapping: AIRCRAFT_ICON_MAPPING,
+          getIcon: ((d: KinematicAircraft) =>
+            d?.isHelicopter ? 'helicopter' : 'aircraft') as unknown as () => string,
+          sizeScale: 1,
+          sizeUnits: 'pixels',
+          sizeMinPixels: currentZoomRef.current < 4.0 ? 12 : 18,
+          sizeMaxPixels: 38,
+          billboard: false,
+          onHover: (info: PickingInfo) => {
+            const picked =
+              typeof info.index === 'number' && info.index >= 0
+                ? aircraftList[info.index]
+                : undefined;
+            if (picked) {
+              setHoveredAircraft({
+                x: info.x,
+                y: info.y,
+                aircraft: picked,
+              });
+            } else {
+              setHoveredAircraft(null);
+            }
+          },
+          onClick: (info: PickingInfo) => {
+            const picked =
+              typeof info.index === 'number' && info.index >= 0
+                ? aircraftList[info.index]
+                : undefined;
+            if (picked) {
+              setSelectedIcao24(picked.icao24);
+            }
+          },
+        }),
+      ];
 
       overlay.setProps({ layers });
     },
@@ -576,6 +590,11 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
               {hoveredAircraft.aircraft.fir}
             </span>
+            {hoveredAircraft.aircraft.isHelicopter && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                HELI
+              </span>
+            )}
             {hoveredAircraft.aircraft.aircraft_code && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-amber-300 border border-amber-500/30">
                 {hoveredAircraft.aircraft.aircraft_code}

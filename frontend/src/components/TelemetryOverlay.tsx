@@ -15,7 +15,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { useFlightStore } from '../store/useFlightStore';
-import { ChileanFIRCode, KinematicAircraft } from '../types/telemetry';
+import { AircraftFilterType, ChileanFIRCode, KinematicAircraft } from '../types/telemetry';
 import { isEmergencySquawk } from '../utils/kinematics';
 
 interface TelemetryOverlayProps {
@@ -38,12 +38,23 @@ const FIR_PRESETS: Array<{
   { code: 'SCIP', label: 'FIR SCIP', sub: 'Rapa Nui Oceánico', lat: -27.164, lon: -109.421, zoom: 5.2 },
 ];
 
+const CATEGORY_FILTER_OPTIONS: Array<{
+  type: AircraftFilterType;
+  label: string;
+}> = [
+  { type: 'all', label: 'TODOS' },
+  { type: 'planes', label: 'AVIONES' },
+  { type: 'helicopters', label: 'HELICÓPTEROS' },
+];
+
 export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
   onTriggerDemoEmergency,
 }) => {
   const wsConnected = useFlightStore((s) => s.wsConnected);
   const metrics = useFlightStore((s) => s.metrics);
   const batchVersion = useFlightStore((s) => s.batchVersion);
+  const filterType = useFlightStore((s) => s.filterType);
+  const setFilterType = useFlightStore((s) => s.setFilterType);
   const activeFIRFilter = useFlightStore((s) => s.activeFIRFilter);
   const setActiveFIRFilter = useFlightStore((s) => s.setActiveFIRFilter);
   const showFIRBoundaries = useFlightStore((s) => s.showFIRBoundaries);
@@ -53,23 +64,53 @@ export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
   const flyTo = useFlightStore((s) => s.flyTo);
   const setSelectedIcao24 = useFlightStore((s) => s.setSelectedIcao24);
 
-  // Detect any active emergency squawk (7500, 7600, 7700) across the tracked fleet
-  const emergencyList = useMemo(() => {
+  // Compute live category counts & active emergency squawk list from the authoritative kinematic map
+  const { emergencyList, categoryCounts } = useMemo(() => {
     void batchVersion;
     const map = useFlightStore.getState().kinematicMap;
     const alerts: KinematicAircraft[] = [];
+    let all = 0;
+    let planes = 0;
+    let helicopters = 0;
+
     for (const ac of map.values()) {
       if (isEmergencySquawk(ac.squawk)) {
         alerts.push(ac);
       }
+      if (activeFIRFilter !== 'ALL' && ac.fir !== activeFIRFilter) {
+        continue;
+      }
+      all++;
+      if (ac.isHelicopter) {
+        helicopters++;
+      } else {
+        planes++;
+      }
     }
-    return alerts;
-  }, [batchVersion]);
+
+    if (activeFIRFilter === 'ALL' && metrics.totalTrackedAircraft > all) {
+      const delta = metrics.totalTrackedAircraft - all;
+      all += delta;
+      planes += delta;
+    }
+
+    return {
+      emergencyList: alerts,
+      categoryCounts: { all, planes, helicopters },
+    };
+  }, [batchVersion, activeFIRFilter, metrics.totalTrackedAircraft]);
+
+  const activeTrafficCount =
+    filterType === 'planes'
+      ? categoryCounts.planes
+      : filterType === 'helicopters'
+      ? categoryCounts.helicopters
+      : categoryCounts.all;
 
   return (
     <>
       {/* Top Tactical Command Bar */}
-      <header className="fixed top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 rounded-2xl bg-slate-950/80 backdrop-blur-xl border border-slate-800/90 shadow-[0_8px_32px_rgba(0,0,0,0.55)]">
+      <header className="fixed top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2.5 px-4 py-2.5 rounded-2xl bg-slate-950/80 backdrop-blur-xl border border-slate-800/90 shadow-[0_8px_32px_rgba(0,0,0,0.55)]">
         {/* Brand & Operational Status */}
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center shadow-[0_0_15px_rgba(6,182,212,0.3)]">
@@ -91,7 +132,7 @@ export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
         </div>
 
         {/* Search & Filter Input */}
-        <div className="relative w-64">
+        <div className="relative w-56">
           <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
@@ -102,8 +143,47 @@ export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
           />
         </div>
 
+        {/* Three-Category Tactical Segmented Control: [TODOS] [AVIONES] [HELICÓPTEROS] */}
+        <div
+          role="group"
+          aria-label="Filtro de categoría de aeronave"
+          className="flex items-center gap-1 p-1 rounded-xl bg-slate-900/90 border border-slate-800 font-mono text-[11px]"
+        >
+          {CATEGORY_FILTER_OPTIONS.map((opt) => {
+            const isActive = filterType === opt.type;
+            const count =
+              opt.type === 'all'
+                ? categoryCounts.all
+                : opt.type === 'planes'
+                ? categoryCounts.planes
+                : categoryCounts.helicopters;
+            return (
+              <button
+                key={opt.type}
+                onClick={() => setFilterType(opt.type)}
+                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1.5 ${
+                  isActive
+                    ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/70 font-bold shadow-[0_0_12px_rgba(6,182,212,0.25)]'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <span>[{opt.label}]</span>
+                <span
+                  className={`text-[10px] px-1 rounded ${
+                    isActive
+                      ? 'bg-cyan-500/25 text-cyan-100'
+                      : 'bg-slate-800/80 text-slate-400'
+                  }`}
+                >
+                  {count}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
         {/* FIR Quick-Jump & Sector Selector */}
-        <div className="hidden xl:flex items-center gap-1.5">
+        <div className="hidden 2xl:flex items-center gap-1.5">
           {FIR_PRESETS.map((preset) => {
             const active = activeFIRFilter === preset.code;
             return (
@@ -151,11 +231,11 @@ export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
         </div>
 
         {/* Live Telemetry Metrics Readout */}
-        <div className="flex items-center gap-3 font-mono text-xs">
+        <div className="flex items-center gap-2.5 font-mono text-xs">
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-900/80 border border-slate-800">
             <Plane className="w-3.5 h-3.5 text-cyan-400" />
             <span className="text-slate-400">TRÁFICO:</span>
-            <span className="font-bold text-white">{metrics.totalTrackedAircraft}</span>
+            <span className="font-bold text-white">{activeTrafficCount}</span>
           </div>
 
           <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-900/80 border border-slate-800">
