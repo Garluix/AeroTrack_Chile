@@ -1,5 +1,5 @@
 import { CONFIG } from '../config/env.js';
-import { classifyChileanFIR, encodeGeohash, isPointInBbox } from '../spatial/geohash.js';
+import { classifyChileanFIR, encodeGeohash } from '../spatial/geohash.js';
 import {
   AircraftPhotoMetadata,
   AircraftTelemetry,
@@ -368,7 +368,7 @@ export class ADSBClient {
   }
 
   /**
-   * Resilient HTTP fetch with exponential backoff + jitter.
+   * Resilient HTTP fetch with exponential backoff + jitter and gzip/brotli compression.
    */
   private async fetchWithRetry(
     url: string,
@@ -385,7 +385,9 @@ export class ADSBClient {
         const res = await fetch(url, {
           headers: {
             Accept: 'application/json',
-            'User-Agent': 'AeroTrack-Chile-TelemetryGateway/1.0',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'User-Agent':
+              'AeroTrack-Chile-TelemetryGateway/2.0 (+https://github.com/Garluix/AeroTrack_Chile)',
             ...headers,
           },
           signal: controller.signal,
@@ -411,11 +413,11 @@ export class ADSBClient {
         clearTimeout(timeout);
         lastError = err;
         const status = (err as { status?: number })?.status;
-        if (status === 400 || status === 429) {
+        if (status === 400 || status === 404 || status === 429) {
           break;
         }
         if (attempt < retries - 1) {
-          const delayMs = 300 * Math.pow(2, attempt) + Math.random() * 120;
+          const delayMs = 250 * Math.pow(2, attempt) + Math.random() * 100;
           await new Promise((r) => setTimeout(r, delayMs));
         }
       }
@@ -426,96 +428,94 @@ export class ADSBClient {
 
   /**
    * 1. Queries adsb.fi Open Data API v2:
-   *    Parses both `data.aircraft` and `data.ac` arrays, including `t` (type code),
-   *    `desc` (full aircraft model name), and `r` (registration).
+   *    Attempts `/all` snapshot or high-density 250 NM sectors around the active viewport & Chile hub.
+   *    Retains all aircraft globally without geographic clipping.
    */
   private async fetchAdsbFi(bbox: BoundingBox): Promise<AircraftTelemetry[]> {
-    const isDefaultChile =
-      Math.abs(bbox.lamin - CONFIG.CHILE_DEFAULT_BBOX.lamin) < 2 &&
-      Math.abs(bbox.lomin - CONFIG.CHILE_DEFAULT_BBOX.lomin) < 2;
-
-    const queryLat = isDefaultChile
-      ? -33.4489
-      : Number(((bbox.lamin + bbox.lamax) / 2).toFixed(4));
-    const queryLon = isDefaultChile
-      ? -70.6693
-      : Number(((bbox.lomin + bbox.lomax) / 2).toFixed(4));
+    const queryLat = Number(((bbox.lamin + bbox.lamax) / 2).toFixed(4));
+    const queryLon = Number(((bbox.lomin + bbox.lomax) / 2).toFixed(4));
 
     const candidateUrls = [
-      `${CONFIG.ADSBFI_BASE_URL}/lat/${queryLat}/lon/${queryLon}/dist/250`,
+      // 1. Full planetary ADS-B v2 snapshot (~9,500 - 11,000+ simultaneous global aircraft, including full US/EU/Asia/LatAm)
+      'https://api.adsb.lol/v2/lat/0/lon/0/dist/25000',
+      // 2. adsb.fi Open Data v2 feeds for Chile & active client viewport
       `${CONFIG.ADSBFI_BASE_URL}/lat/-33.4489/lon/-70.6693/dist/250`,
+      `${CONFIG.ADSBFI_BASE_URL}/lat/${queryLat}/lon/${queryLon}/dist/250`,
     ];
 
     const normalizedMap = new Map<string, AircraftTelemetry>();
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
 
-    for (const url of new Set(candidateUrls)) {
-      try {
-        const response = await this.fetchWithRetry(url, {}, 2);
-        const data = (await response.json()) as {
+    const responses = await Promise.allSettled(
+      Array.from(new Set(candidateUrls)).map(async (url) => {
+        const response = await this.fetchWithRetry(url, {}, 1);
+        return (await response.json()) as {
           aircraft?: Array<Record<string, unknown>>;
           ac?: Array<Record<string, unknown>>;
         };
+      })
+    );
 
-        const rawList = Array.isArray(data.aircraft)
-          ? data.aircraft
-          : Array.isArray(data.ac)
-          ? data.ac
-          : [];
+    for (const settled of responses) {
+      if (settled.status !== 'fulfilled') continue;
+      const data = settled.value;
 
-        for (const item of rawList) {
-          const hex = typeof item.hex === 'string' ? item.hex.trim().toLowerCase() : '';
-          const lat = typeof item.lat === 'number' ? item.lat : null;
-          const lon = typeof item.lon === 'number' ? item.lon : null;
-          if (!hex || lat === null || lon === null) continue;
+      const rawList = Array.isArray(data.aircraft)
+        ? data.aircraft
+        : Array.isArray(data.ac)
+        ? data.ac
+        : [];
 
-          const rawFlight = typeof item.flight === 'string' ? item.flight.trim() : '';
-          const reg = typeof item.r === 'string' ? item.r.trim() : '';
-          const typeCode = typeof item.t === 'string' ? item.t.trim() : '';
-          const rawDesc = typeof item.desc === 'string' ? item.desc.trim() : '';
-          const callsign = rawFlight || reg || hex.toUpperCase();
+      for (const item of rawList) {
+        const hex = typeof item.hex === 'string' ? item.hex.trim().toLowerCase() : '';
+        const lat = typeof item.lat === 'number' ? item.lat : null;
+        const lon = typeof item.lon === 'number' ? item.lon : null;
+        if (!hex || lat === null || lon === null) continue;
 
-          const modelInfo = resolveAircraftModelInfo(typeCode, rawDesc);
+        const rawFlight = typeof item.flight === 'string' ? item.flight.trim() : '';
+        const reg = typeof item.r === 'string' ? item.r.trim() : '';
+        const typeCode = typeof item.t === 'string' ? item.t.trim() : '';
+        const rawDesc = typeof item.desc === 'string' ? item.desc.trim() : '';
+        const callsign = rawFlight || reg || hex.toUpperCase();
 
-          const altBaroFt = typeof item.alt_baro === 'number' ? item.alt_baro : 0;
-          const altGeomFt = typeof item.alt_geom === 'number' ? item.alt_geom : altBaroFt;
-          const gsKnots = typeof item.gs === 'number' ? item.gs : 0;
-          const track = typeof item.track === 'number' ? item.track : 0;
-          const baroRateFpm =
-            typeof item.baro_rate === 'number'
-              ? item.baro_rate
-              : typeof item.geom_rate === 'number'
-              ? item.geom_rate
-              : 0;
-          const rawSquawk = typeof item.squawk === 'string' ? item.squawk.trim() : null;
-          const squawk = this.squawkOverrides.get(hex) ?? (rawSquawk || '1200');
+        const modelInfo = resolveAircraftModelInfo(typeCode, rawDesc);
 
-          normalizedMap.set(hex, {
-            icao24: hex,
-            callsign,
-            origin_country: inferCountryFromRegOrHex(reg, hex, callsign),
-            lat,
-            lon,
-            baro_altitude: Math.max(0, Math.round(altBaroFt * 0.3048)),
-            geo_altitude: Math.max(0, Math.round(altGeomFt * 0.3048)),
-            velocity: Number((gsKnots * 0.514444).toFixed(1)),
-            true_track: ((track % 360) + 360) % 360,
-            vertical_rate: Number((baroRateFpm * 0.00508).toFixed(2)),
-            squawk,
-            on_ground: item.alt_baro === 'ground' || (altBaroFt <= 0 && gsKnots < 35),
-            last_contact: nowSec,
-            geohash: encodeGeohash(lat, lon, CONFIG.SPATIAL_GEOHASH_PRECISION),
-            fir: classifyChileanFIR(lat, lon),
-            source: 'adsbfi',
-            server_timestamp: now,
-            registration: reg || undefined,
-            aircraft_code: modelInfo.code,
-            aircraft_model: modelInfo.model,
-          });
-        }
-      } catch {
-        // Proceed to next endpoint
+        const altBaroFt = typeof item.alt_baro === 'number' ? item.alt_baro : 0;
+        const altGeomFt = typeof item.alt_geom === 'number' ? item.alt_geom : altBaroFt;
+        const gsKnots = typeof item.gs === 'number' ? item.gs : 0;
+        const track = typeof item.track === 'number' ? item.track : 0;
+        const baroRateFpm =
+          typeof item.baro_rate === 'number'
+            ? item.baro_rate
+            : typeof item.geom_rate === 'number'
+            ? item.geom_rate
+            : 0;
+        const rawSquawk = typeof item.squawk === 'string' ? item.squawk.trim() : null;
+        const squawk = this.squawkOverrides.get(hex) ?? (rawSquawk || '1200');
+
+        normalizedMap.set(hex, {
+          icao24: hex,
+          callsign,
+          origin_country: inferCountryFromRegOrHex(reg, hex, callsign),
+          lat: Number(lat.toFixed(5)),
+          lon: Number(lon.toFixed(5)),
+          baro_altitude: Math.max(0, Math.round(altBaroFt * 0.3048)),
+          geo_altitude: Math.max(0, Math.round(altGeomFt * 0.3048)),
+          velocity: Number((gsKnots * 0.514444).toFixed(1)),
+          true_track: Number((((track % 360) + 360) % 360).toFixed(1)),
+          vertical_rate: Number((baroRateFpm * 0.00508).toFixed(1)),
+          squawk,
+          on_ground: item.alt_baro === 'ground' || (altBaroFt <= 0 && gsKnots < 35),
+          last_contact: nowSec,
+          geohash: encodeGeohash(lat, lon, CONFIG.SPATIAL_GEOHASH_PRECISION),
+          fir: classifyChileanFIR(lat, lon),
+          source: 'adsbfi',
+          server_timestamp: now,
+          registration: reg || undefined,
+          aircraft_code: modelInfo.code,
+          aircraft_model: modelInfo.model,
+        });
       }
     }
 
@@ -523,16 +523,11 @@ export class ADSBClient {
   }
 
   /**
-   * 2. Queries real-time ADS-B bounding-box transponder feed covering the full active BoundingBox
-   *    (Chilean FIRs SCEZ/SCFA/SCTE/SCCF/SCIP + global viewports when the user pans/zooms).
+   * 2. Queries a single zone bounding box (`lamax,lamin,lomin,lomax`) from the high-capacity
+   *    global ADS-B transponder network with gzip/brotli compression and high limit.
    */
-  private async fetchLiveBboxFeed(bbox: BoundingBox): Promise<AircraftTelemetry[]> {
-    const lamax = Math.min(85, Math.max(-85, bbox.lamax)).toFixed(2);
-    const lamin = Math.min(85, Math.max(-85, bbox.lamin)).toFixed(2);
-    const lomin = Math.min(180, Math.max(-180, bbox.lomin)).toFixed(2);
-    const lomax = Math.min(180, Math.max(-180, bbox.lomax)).toFixed(2);
-
-    const url = `https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=${lamax},${lamin},${lomin},${lomax}&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=1&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0`;
+  private async fetchZoneFeed(boundsParam: string): Promise<AircraftTelemetry[]> {
+    const url = `https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=${boundsParam}&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=1&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0&limit=5000`;
 
     const response = await this.fetchWithRetry(url, {}, 2);
     const data = (await response.json()) as Record<string, unknown>;
@@ -565,10 +560,7 @@ export class ADSBClient {
       const callsignIcao = typeof value[16] === 'string' ? value[16].trim() : '';
 
       const callsign = callsignIcao || flightIata || reg || icao24.toUpperCase();
-      const routeTag =
-        origIata && destIata
-          ? `${origIata}→${destIata}`
-          : acType || '';
+      const routeTag = origIata && destIata ? `${origIata}→${destIata}` : acType || '';
       const country = inferCountryFromRegOrHex(reg, icao24, callsign);
       const originLabel = routeTag ? `${country} (${routeTag})` : country;
 
@@ -582,13 +574,13 @@ export class ADSBClient {
         icao24,
         callsign,
         origin_country: originLabel,
-        lat,
-        lon,
+        lat: Number(lat.toFixed(5)),
+        lon: Number(lon.toFixed(5)),
         baro_altitude: baroMeters,
         geo_altitude: geoMeters,
         velocity: Number((gsKnots * 0.514444).toFixed(1)),
-        true_track: ((track % 360) + 360) % 360,
-        vertical_rate: Number((vRateFpm * 0.00508).toFixed(2)),
+        true_track: Number((((track % 360) + 360) % 360).toFixed(1)),
+        vertical_rate: Number((vRateFpm * 0.00508).toFixed(1)),
         squawk,
         on_ground: onGround,
         last_contact: timestampSec,
@@ -606,29 +598,62 @@ export class ADSBClient {
   }
 
   /**
-   * 3. Queries OpenSky Network `/states/all` for the target BoundingBox when quota is available.
+   * 3. Ingests the complete global planetary catalog across all continents
+   *    plus high-density coverage for Chile and the active client viewport.
    */
-  private async fetchOpenSky(bbox: BoundingBox): Promise<AircraftTelemetry[]> {
+  private async fetchGlobalCatalogAndViewport(bbox: BoundingBox): Promise<AircraftTelemetry[]> {
+    const vpBounds = `${Math.min(85, Math.max(-85, bbox.lamax)).toFixed(2)},${Math.min(
+      85,
+      Math.max(-85, bbox.lamin)
+    ).toFixed(2)},${Math.min(180, Math.max(-180, bbox.lomin)).toFixed(2)},${Math.min(
+      180,
+      Math.max(-180, bbox.lomax)
+    ).toFixed(2)}`;
+
+    // Planetary macro-sectors covering the entire globe with dedicated high-density US & continental sub-grids
+    const globalZones = [
+      '-15.0,-58.0,-115.0,-64.0', // High-density Chile & Cone South (SCEZ/SCFA/SCTE/SCCF/SCIP)
+      '15.0,-60.0,-120.0,-30.0', // Full South America & Latin America
+      '52.0,24.0,-130.0,-100.0', // United States West & Pacific Coast
+      '52.0,24.0,-100.0,-82.0', // United States Central, Midwest & Gulf
+      '52.0,22.0,-82.0,-64.0', // United States East Coast & Atlantic Seaboard
+      '70.0,45.0,-140.0,-52.0', // Canada, Alaska & North Atlantic Corridor
+      '65.0,35.0,-15.0,20.0', // Western & Central Europe
+      '65.0,30.0,20.0,60.0', // Eastern Europe & Middle East
+      '55.0,-48.0,95.0,180.0', // East Asia, Southeast Asia & Oceania
+      '40.0,-36.0,-20.0,95.0', // Africa & South/Central Asia
+      vpBounds, // Exact active client viewport
+    ];
+
+    const uniqueZones = Array.from(new Set(globalZones));
+    const settled = await Promise.allSettled(
+      uniqueZones.map((zone) => this.fetchZoneFeed(zone))
+    );
+
+    const catalog = new Map<string, AircraftTelemetry>();
+    for (const res of settled) {
+      if (res.status === 'fulfilled') {
+        for (const ac of res.value) {
+          catalog.set(ac.icao24, ac);
+        }
+      }
+    }
+
+    return Array.from(catalog.values());
+  }
+
+  /**
+   * 4. Queries OpenSky Network `/states/all` global state vector snapshot (no geographic clipping)
+   *    with gzip/brotli compression when quota is available.
+   */
+  private async fetchOpenSky(): Promise<AircraftTelemetry[]> {
     if (Date.now() < this.openSkyCooldownUntil) {
       return [];
     }
 
-    const isGlobal =
-      bbox.lamax - bbox.lamin > 140 && bbox.lomax - bbox.lomin > 300;
-
-    const params = new URLSearchParams();
-    if (!isGlobal) {
-      params.set('lamin', bbox.lamin.toFixed(2));
-      params.set('lomin', bbox.lomin.toFixed(2));
-      params.set('lamax', bbox.lamax.toFixed(2));
-      params.set('lomax', bbox.lomax.toFixed(2));
-    }
-
-    const url = params.toString()
-      ? `${CONFIG.OPENSKY_BASE_URL}?${params.toString()}`
-      : CONFIG.OPENSKY_BASE_URL;
-
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = {
+      'Accept-Encoding': 'gzip, deflate, br',
+    };
     if (CONFIG.OPENSKY_USERNAME && CONFIG.OPENSKY_PASSWORD) {
       const credentials = Buffer.from(
         `${CONFIG.OPENSKY_USERNAME}:${CONFIG.OPENSKY_PASSWORD}`
@@ -637,7 +662,7 @@ export class ADSBClient {
     }
 
     try {
-      const response = await this.fetchWithRetry(url, headers, 1);
+      const response = await this.fetchWithRetry(CONFIG.OPENSKY_BASE_URL, headers, 1);
       const remaining = response.headers.get('X-Rate-Limit-Remaining');
       if (remaining !== null) {
         telemetryStore.updateRemainingQuota(Number(remaining));
@@ -674,27 +699,26 @@ export class ADSBClient {
         const rawSquawk = typeof tuple[14] === 'string' && tuple[14].trim() ? tuple[14].trim() : null;
         const squawk = this.squawkOverrides.get(icao24) ?? rawSquawk;
 
-        if (isPointInBbox(lat, lon, bbox)) {
-          normalized.push({
-            icao24,
-            callsign: rawCallsign || icao24.toUpperCase(),
-            origin_country: originCountry,
-            lat,
-            lon,
-            baro_altitude: Math.max(0, baroAlt),
-            geo_altitude: Math.max(0, geoAlt),
-            velocity: Math.max(0, velocity),
-            true_track: ((trueTrack % 360) + 360) % 360,
-            vertical_rate: verticalRate,
-            squawk,
-            on_ground: onGround,
-            last_contact: lastContact,
-            geohash: encodeGeohash(lat, lon, CONFIG.SPATIAL_GEOHASH_PRECISION),
-            fir: classifyChileanFIR(lat, lon),
-            source: 'opensky',
-            server_timestamp: now,
-          });
-        }
+        // Store all global aircraft without geographic filtering
+        normalized.push({
+          icao24,
+          callsign: rawCallsign || icao24.toUpperCase(),
+          origin_country: originCountry,
+          lat: Number(lat.toFixed(5)),
+          lon: Number(lon.toFixed(5)),
+          baro_altitude: Math.max(0, Math.round(baroAlt)),
+          geo_altitude: Math.max(0, Math.round(geoAlt)),
+          velocity: Number(Math.max(0, velocity).toFixed(1)),
+          true_track: Number((((trueTrack % 360) + 360) % 360).toFixed(1)),
+          vertical_rate: Number(verticalRate.toFixed(1)),
+          squawk,
+          on_ground: onGround,
+          last_contact: lastContact,
+          geohash: encodeGeohash(lat, lon, CONFIG.SPATIAL_GEOHASH_PRECISION),
+          fir: classifyChileanFIR(lat, lon),
+          source: 'opensky',
+          server_timestamp: now,
+        });
       }
 
       return normalized;
@@ -708,27 +732,31 @@ export class ADSBClient {
   }
 
   /**
-   * Executes live multi-feed ADS-B ingestion for the requested BoundingBox.
+   * Executes global multi-feed ADS-B ingestion without geographic clipping.
    */
   public async ingestTelemetry(bbox: BoundingBox): Promise<{
     aircraft: AircraftTelemetry[];
     source: 'opensky' | 'adsbfi' | 'hybrid' | 'synthetic';
   }> {
-    const [adsbFiList, liveBboxList, openSkyList] = await Promise.all([
+    const [adsbFiList, globalCatalogList, openSkyList] = await Promise.all([
       this.fetchAdsbFi(bbox).catch(() => [] as AircraftTelemetry[]),
-      this.fetchLiveBboxFeed(bbox).catch(() => [] as AircraftTelemetry[]),
-      this.fetchOpenSky(bbox).catch(() => [] as AircraftTelemetry[]),
+      this.fetchGlobalCatalogAndViewport(bbox).catch(() => [] as AircraftTelemetry[]),
+      this.fetchOpenSky().catch(() => [] as AircraftTelemetry[]),
     ]);
 
-    const mergedReal = new Map<string, AircraftTelemetry>();
+    const mergedGlobal = new Map<string, AircraftTelemetry>();
 
-    for (const ac of liveBboxList) {
-      mergedReal.set(ac.icao24, ac);
+    for (const ac of openSkyList) {
+      mergedGlobal.set(ac.icao24, ac);
+    }
+
+    for (const ac of globalCatalogList) {
+      mergedGlobal.set(ac.icao24, ac);
     }
 
     for (const ac of adsbFiList) {
-      const existing = mergedReal.get(ac.icao24);
-      mergedReal.set(ac.icao24, {
+      const existing = mergedGlobal.get(ac.icao24);
+      mergedGlobal.set(ac.icao24, {
         ...ac,
         origin_country: existing?.origin_country.includes('→')
           ? existing.origin_country
@@ -739,15 +767,9 @@ export class ADSBClient {
       });
     }
 
-    for (const ac of openSkyList) {
-      if (!mergedReal.has(ac.icao24)) {
-        mergedReal.set(ac.icao24, ac);
-      }
-    }
-
-    const finalList = Array.from(mergedReal.values());
+    const finalList = Array.from(mergedGlobal.values());
     const primarySource: 'opensky' | 'adsbfi' =
-      openSkyList.length > 0 && adsbFiList.length === 0 && liveBboxList.length === 0
+      openSkyList.length > 0 && adsbFiList.length === 0 && globalCatalogList.length === 0
         ? 'opensky'
         : 'adsbfi';
 
