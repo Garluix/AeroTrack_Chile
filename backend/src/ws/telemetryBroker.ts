@@ -10,6 +10,7 @@ import {
   AircraftTelemetry,
   BoundingBox,
   ClientWSMessage,
+  CompactAircraftTuple,
   ServerWSMessage,
 } from '../types/telemetry.js';
 import { telemetryStore } from '../cache/redisStore.js';
@@ -23,6 +24,29 @@ interface ClientSession {
   zoom: number;
   geohashPrefixes: string[];
   selectedIcao24: string | null;
+}
+
+function toCompactTuple(ac: AircraftTelemetry): CompactAircraftTuple {
+  return [
+    ac.icao24,
+    ac.callsign,
+    ac.origin_country,
+    ac.lat,
+    ac.lon,
+    ac.baro_altitude,
+    ac.geo_altitude,
+    ac.velocity,
+    ac.true_track,
+    ac.vertical_rate,
+    ac.squawk,
+    ac.on_ground ? 1 : 0,
+    ac.last_contact,
+    ac.geohash,
+    ac.fir,
+    ac.registration || '',
+    ac.aircraft_code || '',
+    ac.aircraft_model || '',
+  ];
 }
 
 export class TelemetryWebSocketBroker {
@@ -129,8 +153,6 @@ export class TelemetryWebSocketBroker {
 
   /**
    * Computes the effective query BoundingBox across all active clients.
-   * Defaults to Chile's BoundingBox (lamin: -56.5, lomin: -109.5, lamax: -17.5, lomax: -66.0)
-   * and expands dynamically if any client pans outside the default domain.
    */
   public getEffectiveQueryBbox(): BoundingBox {
     if (this.sessions.size === 0) {
@@ -164,22 +186,67 @@ export class TelemetryWebSocketBroker {
   }
 
   /**
-   * Sends an immediate spatially-filtered snapshot to a single client session.
+   * Serializes the full active aircraft set or dynamic viewport subset into compact flat tuples
+   * with ZERO artificial caps (supports 10,000 - 15,000+ simultaneous global aircraft).
+   */
+  private filterForSessionViewport(
+    candidates: AircraftTelemetry[],
+    session: ClientSession
+  ): CompactAircraftTuple[] {
+    const latSpan = Math.abs(session.bbox.lamax - session.bbox.lamin);
+    const lonSpan = Math.abs(session.bbox.lomax - session.bbox.lomin);
+    const isContinentalOrGlobalView = session.zoom <= 5.8 || latSpan > 25 || lonSpan > 35;
+
+    // When viewing a country/continent (e.g. United States, South America, or Global view),
+    // transmit the entire global catalog without any slice or limit!
+    if (isContinentalOrGlobalView) {
+      const tuples = new Array<CompactAircraftTuple>(candidates.length);
+      for (let i = 0; i < candidates.length; i++) {
+        tuples[i] = toCompactTuple(candidates[i]);
+      }
+      return tuples;
+    }
+
+    const padDeg = 12.0;
+    const paddedBbox: BoundingBox = {
+      lamin: Math.max(-85, session.bbox.lamin - padDeg),
+      lomin: Math.max(-180, session.bbox.lomin - padDeg),
+      lamax: Math.min(85, session.bbox.lamax + padDeg),
+      lomax: Math.min(180, session.bbox.lomax + padDeg),
+    };
+
+    const filtered: AircraftTelemetry[] = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const ac = candidates[i];
+      if (
+        ac.icao24 === session.selectedIcao24 ||
+        ac.fir !== 'INTL' ||
+        ac.squawk === '7500' ||
+        ac.squawk === '7600' ||
+        ac.squawk === '7700' ||
+        isPointInBbox(ac.lat, ac.lon, paddedBbox)
+      ) {
+        filtered.push(ac);
+      }
+    }
+
+    const tuples = new Array<CompactAircraftTuple>(filtered.length);
+    for (let i = 0; i < filtered.length; i++) {
+      tuples[i] = toCompactTuple(filtered[i]);
+    }
+    return tuples;
+  }
+
+  /**
+   * Sends the full initial global catalog snapshot to a newly connected or panning client session
+   * so all 10,000+ aircraft across the US, Europe, Asia, and Chile are immediately available in client memory.
    */
   private sendSnapshotToSession(session: ClientSession): void {
     const all = telemetryStore.getAllAircraft();
-    const paddedBbox: BoundingBox = {
-      lamin: session.bbox.lamin - 3.0,
-      lomin: session.bbox.lomin - 3.0,
-      lamax: session.bbox.lamax + 3.0,
-      lomax: session.bbox.lomax + 3.0,
-    };
-
-    const filtered = all.filter(
-      (ac) =>
-        isPointInBbox(ac.lat, ac.lon, paddedBbox) ||
-        ac.icao24 === session.selectedIcao24
-    );
+    const tuples = new Array<CompactAircraftTuple>(all.length);
+    for (let i = 0; i < all.length; i++) {
+      tuples[i] = toCompactTuple(all[i]);
+    }
 
     this.sendToSession(session, {
       type: 'telemetry_batch',
@@ -187,14 +254,15 @@ export class TelemetryWebSocketBroker {
       source: this.lastUpstreamSource,
       activeBbox: this.getEffectiveQueryBbox(),
       geohashPrefixes: session.geohashPrefixes,
-      aircraft: filtered,
+      tuples,
       removedIds: [],
+      totalGlobalCount: all.length,
     });
   }
 
   /**
-   * Broadcasts updated aircraft frames and system metrics to all connected clients,
-   * segmented by each client's spatial viewport and geohash cells.
+   * Broadcasts updated aircraft frames as compact flat tuples and system metrics to all connected clients,
+   * segmented by each client's spatial viewport frustum.
    */
   public broadcastUpdate(
     updatedAircraft: AircraftTelemetry[],
@@ -207,20 +275,7 @@ export class TelemetryWebSocketBroker {
     for (const session of this.sessions.values()) {
       if (session.socket.readyState !== 1) continue;
 
-      const paddedBbox: BoundingBox = {
-        lamin: session.bbox.lamin - 3.0,
-        lomin: session.bbox.lomin - 3.0,
-        lamax: session.bbox.lamax + 3.0,
-        lomax: session.bbox.lomax + 3.0,
-      };
-
-      const prefixSet = new Set(session.geohashPrefixes);
-      const clientAircraft = updatedAircraft.filter(
-        (ac) =>
-          prefixSet.has(ac.geohash) ||
-          isPointInBbox(ac.lat, ac.lon, paddedBbox) ||
-          ac.icao24 === session.selectedIcao24
-      );
+      const tuples = this.filterForSessionViewport(updatedAircraft, session);
 
       this.sendToSession(session, {
         type: 'telemetry_batch',
@@ -228,8 +283,9 @@ export class TelemetryWebSocketBroker {
         source: this.lastUpstreamSource,
         activeBbox: effectiveBbox,
         geohashPrefixes: session.geohashPrefixes,
-        aircraft: clientAircraft,
+        tuples,
         removedIds,
+        totalGlobalCount: totalTracked,
       });
 
       if (session.selectedIcao24) {

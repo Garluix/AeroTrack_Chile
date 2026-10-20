@@ -8,7 +8,6 @@ export class TelemetryCacheStore {
 
   // High-speed in-memory mirror / fallback for sub-millisecond spatial queries
   private memoryStates = new Map<string, AircraftTelemetry>();
-  private memorySignatures = new Map<string, string>();
   private memoryTrails = new Map<string, TrailBreadcrumb[]>();
   private rateLimitCooldownUntil = 0;
   private remainingQuota = 400;
@@ -56,13 +55,6 @@ export class TelemetryCacheStore {
   }
 
   /**
-   * Computes a compact state frame signature for deduplication.
-   */
-  private computeSignature(frame: AircraftTelemetry): string {
-    return `${frame.lat.toFixed(5)}:${frame.lon.toFixed(5)}:${Math.round(frame.baro_altitude)}:${Math.round(frame.velocity)}:${Math.round(frame.true_track)}:${frame.squawk ?? 'none'}`;
-  }
-
-  /**
    * Upserts a batch of normalized aircraft frames with deduplication and trail persistence.
    * Returns { updated, removedIds }
    */
@@ -76,12 +68,11 @@ export class TelemetryCacheStore {
 
     const pipeline = this.redisConnected && this.redis ? this.redis.pipeline() : null;
 
-    for (const frame of frames) {
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
       seenIds.add(frame.icao24);
-      const sig = this.computeSignature(frame);
-      const prevSig = this.memorySignatures.get(frame.icao24);
-
       this.memoryStates.set(frame.icao24, frame);
+      updated.push(frame);
 
       // Append breadcrumb to geodesic trail if position moved or trail is empty
       let trail = this.memoryTrails.get(frame.icao24);
@@ -97,33 +88,25 @@ export class TelemetryCacheStore {
         Math.abs(lastPoint.lon - frame.lon) > 0.0004;
 
       if (movedEnough) {
-        const breadcrumb: TrailBreadcrumb = {
+        trail.push({
           lat: frame.lat,
           lon: frame.lon,
           alt: frame.baro_altitude,
           velocity: frame.velocity,
           track: frame.true_track,
           timestamp: frame.server_timestamp,
-        };
-        trail.push(breadcrumb);
+        });
         if (trail.length > CONFIG.TRAIL_MAX_POINTS) {
           trail.shift();
         }
       }
 
-      if (sig !== prevSig) {
-        this.memorySignatures.set(frame.icao24, sig);
-        updated.push(frame);
-
-        if (pipeline) {
-          const stateKey = `${CONFIG.REDIS_KEY_PREFIX}state:${frame.icao24}`;
-          const trailKey = `${CONFIG.REDIS_KEY_PREFIX}trail:${frame.icao24}`;
-          pipeline.set(stateKey, JSON.stringify(frame), 'EX', CONFIG.STATE_TTL_SECONDS);
-          pipeline.set(trailKey, JSON.stringify(trail), 'EX', CONFIG.STATE_TTL_SECONDS * 3);
-        }
-      } else {
-        // Still include active aircraft in periodic broadcast so new/existing clients have synchronized timestamps
-        updated.push(frame);
+      // Persist Chilean FIR & emergency squawk states in Redis pipeline while keeping full 12k+ global catalog in RAM
+      if (pipeline && (frame.fir !== 'INTL' || frame.squawk === '7500' || frame.squawk === '7600' || frame.squawk === '7700')) {
+        const stateKey = `${CONFIG.REDIS_KEY_PREFIX}state:${frame.icao24}`;
+        const trailKey = `${CONFIG.REDIS_KEY_PREFIX}trail:${frame.icao24}`;
+        pipeline.set(stateKey, JSON.stringify(frame), 'EX', CONFIG.STATE_TTL_SECONDS);
+        pipeline.set(trailKey, JSON.stringify(trail), 'EX', CONFIG.STATE_TTL_SECONDS * 3);
       }
     }
 
@@ -133,7 +116,6 @@ export class TelemetryCacheStore {
       const ageSec = nowSec - state.last_contact;
       if (!seenIds.has(icao24) && ageSec > CONFIG.STATE_TTL_SECONDS) {
         this.memoryStates.delete(icao24);
-        this.memorySignatures.delete(icao24);
         this.memoryTrails.delete(icao24);
         removedIds.push(icao24);
         if (pipeline) {

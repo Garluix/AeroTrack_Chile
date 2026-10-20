@@ -22,7 +22,8 @@ async function bootstrap(): Promise<void> {
 
   await app.register(websocket, {
     options: {
-      maxPayload: 1048576,
+      maxPayload: 16 * 1024 * 1024,
+      perMessageDeflate: true,
     },
   });
 
