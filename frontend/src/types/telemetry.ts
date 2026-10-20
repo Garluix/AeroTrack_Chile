@@ -1,5 +1,7 @@
 export type ChileanFIRCode = 'SCEZ' | 'SCFA' | 'SCTE' | 'SCCF' | 'SCIP' | 'INTL';
 
+export type AircraftFilterType = 'all' | 'planes' | 'helicopters';
+
 export interface BoundingBox {
   lamin: number;
   lomin: number;
@@ -37,9 +39,10 @@ export interface AircraftTelemetry {
   registration?: string;
   aircraft_code?: string;
   aircraft_model?: string;
+  isHelicopter: boolean;
 }
 
-export type AirframeCategory = 'twin-jet' | 'quad-jet' | 'turboprop';
+export type AirframeCategory = 'twin-jet' | 'quad-jet' | 'turboprop' | 'helicopter';
 
 export interface AircraftPhotoMetadata {
   icao24: string;
@@ -107,7 +110,7 @@ export interface SystemMetrics {
  *   0: icao24, 1: callsign, 2: origin_country, 3: lat, 4: lon,
  *   5: baro_altitude, 6: geo_altitude, 7: velocity, 8: true_track, 9: vertical_rate,
  *   10: squawk, 11: on_ground (0 | 1), 12: last_contact, 13: geohash, 14: fir,
- *   15: registration, 16: aircraft_code, 17: aircraft_model
+ *   15: registration, 16: aircraft_code, 17: aircraft_model, 18: isHelicopter
  * ]
  */
 export type CompactAircraftTuple = [
@@ -128,7 +131,8 @@ export type CompactAircraftTuple = [
   ChileanFIRCode,
   string,
   string,
-  string
+  string,
+  boolean
 ];
 
 export type ServerWSMessage =

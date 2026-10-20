@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import {
+  AircraftFilterType,
   AircraftTelemetry,
   BoundingBox,
   ChileanFIRCode,
@@ -31,6 +32,9 @@ interface FlightStoreState {
   selectedAircraftSnapshot: KinematicAircraft | null;
   selectedTrail: TrailBreadcrumb[];
 
+  // Three-category tactical filter: 'all' | 'planes' | 'helicopters'
+  filterType: AircraftFilterType;
+
   // FIR sector definitions & visibility
   firs: FIRDefinition[];
   showFIRBoundaries: boolean;
@@ -55,6 +59,7 @@ interface FlightStoreState {
     source: string,
     totalGlobalCount?: number
   ) => void;
+  setFilterType: (type: AircraftFilterType) => void;
   setSelectedIcao24: (icao24: string | null) => void;
   syncSelectedSnapshot: () => void;
   setSelectedTrail: (icao24: string, trail: TrailBreadcrumb[]) => void;
@@ -102,6 +107,7 @@ function upsertKinematicEntity(
     existing.fir = frame.fir;
     existing.source = frame.source;
     existing.server_timestamp = frame.server_timestamp;
+    existing.isHelicopter = Boolean(frame.isHelicopter);
     if (frame.registration) existing.registration = frame.registration;
     if (frame.aircraft_code) existing.aircraft_code = frame.aircraft_code;
     if (frame.aircraft_model) existing.aircraft_model = frame.aircraft_model;
@@ -128,6 +134,7 @@ function upsertKinematicEntity(
   } else {
     map.set(frame.icao24, {
       ...frame,
+      isHelicopter: Boolean(frame.isHelicopter),
       rawLat: frame.lat,
       rawLon: frame.lon,
       anchorLat: frame.lat,
@@ -152,6 +159,8 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
   selectedIcao24: null,
   selectedAircraftSnapshot: null,
   selectedTrail: [],
+
+  filterType: 'all',
 
   firs: [],
   showFIRBoundaries: true,
@@ -194,7 +203,7 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
       map.delete(removedIds[i]);
     }
 
-    // 1. Decode compact flat tuples [icao24, callsign, origin_country, lat, lon, ...]
+    // 1. Decode compact flat tuples [icao24, callsign, origin_country, lat, lon, ..., isHelicopter]
     if (tuples && tuples.length > 0) {
       for (let i = 0; i < tuples.length; i++) {
         const t = tuples[i];
@@ -221,6 +230,7 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
             registration: t[15] || undefined,
             aircraft_code: t[16] || undefined,
             aircraft_model: t[17] || undefined,
+            isHelicopter: Boolean(t[18]),
           },
           nowMs
         );
@@ -253,6 +263,8 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
       },
     }));
   },
+
+  setFilterType: (filterType) => set({ filterType }),
 
   setSelectedIcao24: (icao24) => {
     const normalized = icao24 ? icao24.toLowerCase() : null;

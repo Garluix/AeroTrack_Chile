@@ -430,41 +430,91 @@ export function msToMach(velocityMs: number, altitudeMeters: number): number {
 }
 
 /**
- * Generates a high-DPI aircraft icon atlas PNG data URL rendered from an exact SVG vector Path2D
- * centered at pivot (64, 64) in a 128x128 coordinate space, oriented pointing North (0 deg)
- * so Deck.gl IconLayer in Google Chrome decodes it natively via createImageBitmap and rotates
- * around its exact center pivot in sync with `true_track`.
+ * Generates a high-DPI 256x128 dual-icon atlas PNG data URL containing:
+ * - Slot 0 [x: 0..128, pivot (64,64)]: Fixed-wing commercial jet ('aircraft') pointing North (0 deg).
+ * - Slot 1 [x: 128..256, pivot (192,64)]: Top-down rotorcraft/helicopter ('helicopter') with main rotor,
+ *   fuselage cabin, landing skids, and tail boom/rotor pointing North (0 deg).
  */
 export function createAircraftIconAtlasDataUrl(): string {
   if (typeof document !== 'undefined') {
     const canvas = document.createElement('canvas');
-    canvas.width = 128;
+    canvas.width = 256;
     canvas.height = 128;
     const ctx = canvas.getContext('2d');
     if (ctx) {
-      ctx.clearRect(0, 0, 128, 128);
+      ctx.clearRect(0, 0, 256, 128);
+
+      // 1. Slot 0 (x: 0..128, center 64,64): Commercial Fixed-Wing Jet
       ctx.save();
       ctx.translate(64, 64);
-      const path = new Path2D(
+      const jetPath = new Path2D(
         'M 0 -52 C 5 -42, 7 -28, 7 -12 L 48 12 L 48 20 L 7 8 L 6 34 L 22 45 L 22 51 L 0 44 L -22 51 L -22 45 L -6 34 L -7 8 L -48 20 L -48 12 L -7 -12 C -7 -28, -5 -42, 0 -52 Z'
       );
       ctx.fillStyle = '#ffffff';
-      ctx.fill(path);
+      ctx.fill(jetPath);
       ctx.lineWidth = 3.5;
       ctx.strokeStyle = '#ffffff';
       ctx.lineJoin = 'round';
-      ctx.stroke(path);
+      ctx.stroke(jetPath);
+      ctx.restore();
+
+      // 2. Slot 1 (x: 128..256, center 192,64): Top-Down Rotorcraft / Helicopter
+      ctx.save();
+      ctx.translate(192, 64);
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      // Landing skids & struts
+      const skidsPath = new Path2D(
+        'M -18 -24 L -18 10 M 18 -24 L 18 10 M -18 -14 L -8 -14 M 18 -14 L 8 -14 M -18 2 L -8 2 M 18 2 L 8 2'
+      );
+      ctx.lineWidth = 3.5;
+      ctx.stroke(skidsPath);
+
+      // Helicopter streamlined cabin, tail boom, horizontal stabilizer, and tail rotor
+      const heliBody = new Path2D(
+        'M 0 -36 C 10 -36, 13 -22, 12 -6 C 11 6, 6 14, 3 18 L 2 44 L 15 44 L 15 49 L 2 49 L 2 54 L -2 54 L -2 49 L -15 49 L -15 44 L -2 44 L -3 18 C -6 14, -11 6, -12 -6 C -13 -22, -10 -36, 0 -36 Z'
+      );
+      ctx.fill(heliBody);
+
+      // Subtle outer rotor wash ring
+      ctx.beginPath();
+      ctx.arc(0, -8, 44, 0, Math.PI * 2);
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+
+      // 4-blade main rotor X-cross centered over the main mast (0, -8)
+      const bladesPath = new Path2D(
+        'M -33 -41 L 33 25 M 33 -41 L -33 25'
+      );
+      ctx.lineWidth = 5.5;
+      ctx.stroke(bladesPath);
+
+      // Main rotor hub cap
+      ctx.beginPath();
+      ctx.arc(0, -8, 6, 0, Math.PI * 2);
+      ctx.fill();
+
       ctx.restore();
       return canvas.toDataURL('image/png');
     }
   }
 
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="128" viewBox="0 0 256 128">
     <g transform="translate(64,64)">
       <path
         d="M 0 -52 C 5 -42, 7 -28, 7 -12 L 48 12 L 48 20 L 7 8 L 6 34 L 22 45 L 22 51 L 0 44 L -22 51 L -22 45 L -6 34 L -7 8 L -48 20 L -48 12 L -7 -12 C -7 -28, -5 -42, 0 -52 Z"
         fill="#ffffff"
       />
+    </g>
+    <g transform="translate(192,64)" fill="#ffffff" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M -18 -24 L -18 10 M 18 -24 L 18 10 M -18 -14 L -8 -14 M 18 -14 L 8 -14 M -18 2 L -8 2 M 18 2 L 8 2" stroke-width="3.5" fill="none" />
+      <path d="M 0 -36 C 10 -36, 13 -22, 12 -6 C 11 6, 6 14, 3 18 L 2 44 L 15 44 L 15 49 L 2 49 L 2 54 L -2 54 L -2 49 L -15 49 L -15 44 L -2 44 L -3 18 C -6 14, -11 6, -12 -6 C -13 -22, -10 -36, 0 -36 Z" />
+      <circle cx="0" cy="-8" r="44" stroke-width="2.2" fill="none" />
+      <path d="M -33 -41 L 33 25 M 33 -41 L -33 25" stroke-width="5.5" fill="none" />
+      <circle cx="0" cy="-8" r="6" />
     </g>
   </svg>`;
   return `data:image/svg+xml;base64,${btoa(svg)}`;

@@ -12,6 +12,7 @@ export interface KinematicTypedBuffers {
   angles: Float32Array;
   sizes: Float32Array;
   colors: Uint8Array;
+  iconDefs: Float32Array;
   count: number;
 }
 
@@ -26,11 +27,8 @@ const MAX_GPU_ENTITIES = 25000;
  * 60/120 FPS requestAnimationFrame Dead Reckoning & Spherical Great Circle interpolation loop:
  *   P(t) = P_anterior + (P_objetivo(t) - P_anterior) * alpha
  * - Decouples network WebSocket arrival from WebGL rendering.
+ * - Applies the 3-category tactical filter ('all' | 'planes' | 'helicopters') in-memory before GPU buffer injection.
  * - Maintains pre-allocated typed binary buffers (Float32Array / Uint8Array) for >20,000 instances.
- * - Dynamic Viewport Culling:
- *   * High zoom (regional/city): prioritizes entities inside the camera frustum with full 3D Great Circle Slerp,
- *     omitting off-screen entities from GPU upload.
- *   * Low/continental zoom (e.g. United States or Global view): renders 100% of markers in view without artificial limits.
  */
 export function useDeadReckoning(
   onFrame: (
@@ -48,11 +46,12 @@ export function useDeadReckoning(
   const getViewportStateRef = useRef(getViewportState);
   getViewportStateRef.current = getViewportState;
 
-  // Pre-allocated binary typed buffers outside React reconciliation (Zero GC allocations at 60 FPS)
+  // Pre-allocated binary typed buffers outside React reconciliation (Zero GC allocations at 60/120 FPS)
   const positionsBufferRef = useRef<Float32Array>(new Float32Array(MAX_GPU_ENTITIES * 3));
   const anglesBufferRef = useRef<Float32Array>(new Float32Array(MAX_GPU_ENTITIES));
   const sizesBufferRef = useRef<Float32Array>(new Float32Array(MAX_GPU_ENTITIES));
   const colorsBufferRef = useRef<Uint8Array>(new Uint8Array(MAX_GPU_ENTITIES * 4));
+  const iconDefsBufferRef = useRef<Float32Array>(new Float32Array(MAX_GPU_ENTITIES * 7));
   const visibleListRef = useRef<KinematicAircraft[]>([]);
 
   useEffect(() => {
@@ -70,6 +69,7 @@ export function useDeadReckoning(
       const state = useFlightStore.getState();
       const map = state.kinematicMap;
       const activeFilter = state.activeFIRFilter;
+      const filterType = state.filterType;
       const searchQuery = state.searchQuery.trim().toLowerCase();
       const selectedId = state.selectedIcao24;
 
@@ -94,16 +94,24 @@ export function useDeadReckoning(
       const angles = anglesBufferRef.current;
       const sizes = sizesBufferRef.current;
       const colors = colorsBufferRef.current;
+      const iconDefs = iconDefsBufferRef.current;
       let gpuIdx = 0;
 
       for (const ac of map.values()) {
+        // 1. In-memory category filtering BEFORE GPU buffer injection (zero React re-renders)
+        if (filterType === 'planes' && ac.isHelicopter === true) {
+          continue;
+        }
+        if (filterType === 'helicopters' && ac.isHelicopter !== true) {
+          continue;
+        }
+
         const isSelected = ac.icao24 === selectedId;
         const isEmergency = isEmergencySquawk(ac.squawk);
 
-        // Dynamic Viewport Frustum Culling:
+        // 2. Dynamic Viewport Frustum Culling:
         // When zoomed into a specific region (or continent), omit entities outside the visible camera frustum
         // BEFORE running heavy per-frame trigonometry or uploading to the GPU.
-        // In full world view (isGlobalView), render all global markers without clipping.
         if (
           frustum &&
           !isGlobalView &&
@@ -145,7 +153,26 @@ export function useDeadReckoning(
           positions[posOffset + 2] = 0;
 
           angles[gpuIdx] = (360 - ac.renderTrack) % 360;
-          sizes[gpuIdx] = isSelected ? 32 : isEmergency ? 30 : baseIconSize;
+          sizes[gpuIdx] = isSelected
+            ? 32
+            : isEmergency
+            ? 30
+            : ac.isHelicopter
+            ? baseIconSize + 2
+            : baseIconSize;
+
+          // Deck.gl IconLayer instanceIconDefs binary layout (7 floats):
+          // [width/2 - anchorX, height/2 - anchorY, x, y, width, height, mask ? 1 : 0]
+          // Slot 0 ('aircraft'): x = 0, y = 0, w = 128, h = 128, anchor = (64,64), mask = 1
+          // Slot 1 ('helicopter'): x = 128, y = 0, w = 128, h = 128, anchor = (64,64), mask = 1
+          const iconOffset = gpuIdx * 7;
+          iconDefs[iconOffset] = 0;
+          iconDefs[iconOffset + 1] = 0;
+          iconDefs[iconOffset + 2] = ac.isHelicopter ? 128 : 0;
+          iconDefs[iconOffset + 3] = 0;
+          iconDefs[iconOffset + 4] = 128;
+          iconDefs[iconOffset + 5] = 128;
+          iconDefs[iconOffset + 6] = 1;
 
           writeAltitudeColorRGBA(
             colors,
@@ -165,6 +192,7 @@ export function useDeadReckoning(
         angles,
         sizes,
         colors,
+        iconDefs,
         count: gpuIdx,
       });
 
