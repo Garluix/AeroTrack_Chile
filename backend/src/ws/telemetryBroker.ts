@@ -24,6 +24,7 @@ interface ClientSession {
   zoom: number;
   geohashPrefixes: string[];
   selectedIcao24: string | null;
+  hasReceivedFullCatalog: boolean;
 }
 
 function toCompactTuple(ac: AircraftTelemetry): CompactAircraftTuple {
@@ -46,6 +47,7 @@ function toCompactTuple(ac: AircraftTelemetry): CompactAircraftTuple {
     ac.registration || '',
     ac.aircraft_code || '',
     ac.aircraft_model || '',
+    Boolean(ac.isHelicopter),
   ];
 }
 
@@ -62,6 +64,7 @@ export class TelemetryWebSocketBroker {
       zoom: 6.0,
       geohashPrefixes: getBboxGeohashPrefixes(initialBbox, CONFIG.SPATIAL_GEOHASH_PRECISION),
       selectedIcao24: null,
+      hasReceivedFullCatalog: false,
     };
 
     this.sessions.set(id, session);
@@ -195,11 +198,18 @@ export class TelemetryWebSocketBroker {
   ): CompactAircraftTuple[] {
     const latSpan = Math.abs(session.bbox.lamax - session.bbox.lamin);
     const lonSpan = Math.abs(session.bbox.lomax - session.bbox.lomin);
-    const isContinentalOrGlobalView = session.zoom <= 5.8 || latSpan > 25 || lonSpan > 35;
+    const isContinentalOrGlobalView =
+      !session.hasReceivedFullCatalog ||
+      session.zoom <= 5.8 ||
+      latSpan > 25 ||
+      lonSpan > 35;
 
-    // When viewing a country/continent (e.g. United States, South America, or Global view),
-    // transmit the entire global catalog without any slice or limit!
+    // When viewing a country/continent (e.g. United States, South America, or Global view)
+    // or hydrating the initial global catalog, transmit the entire global catalog without any slice or limit!
     if (isContinentalOrGlobalView) {
+      if (candidates.length > 500) {
+        session.hasReceivedFullCatalog = true;
+      }
       const tuples = new Array<CompactAircraftTuple>(candidates.length);
       for (let i = 0; i < candidates.length; i++) {
         tuples[i] = toCompactTuple(candidates[i]);
@@ -243,6 +253,9 @@ export class TelemetryWebSocketBroker {
    */
   private sendSnapshotToSession(session: ClientSession): void {
     const all = telemetryStore.getAllAircraft();
+    if (all.length > 500) {
+      session.hasReceivedFullCatalog = true;
+    }
     const tuples = new Array<CompactAircraftTuple>(all.length);
     for (let i = 0; i < all.length; i++) {
       tuples[i] = toCompactTuple(all[i]);

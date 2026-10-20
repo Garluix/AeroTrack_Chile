@@ -40,11 +40,12 @@ export interface AircraftTelemetry {
   source: 'opensky' | 'adsbfi' | 'synthetic';
   server_timestamp: number; // Unix epoch ms
   registration?: string; // e.g., CC-BEN, N880BJ
-  aircraft_code?: string; // ICAO type designator, e.g., A321, B789
+  aircraft_code?: string; // ICAO type designator, e.g., A321, B789, EC35
   aircraft_model?: string; // Full human-readable model, e.g., Airbus A321-211SL
+  isHelicopter: boolean; // True for rotorcraft (category A7 / 7 or ICAO helicopter designator)
 }
 
-export type AirframeCategory = 'twin-jet' | 'quad-jet' | 'turboprop';
+export type AirframeCategory = 'twin-jet' | 'quad-jet' | 'turboprop' | 'helicopter';
 
 export interface AircraftPhotoMetadata {
   icao24: string;
@@ -93,7 +94,7 @@ export type ClientWSMessage =
  *   0: icao24, 1: callsign, 2: origin_country, 3: lat, 4: lon,
  *   5: baro_altitude, 6: geo_altitude, 7: velocity, 8: true_track, 9: vertical_rate,
  *   10: squawk, 11: on_ground (0 | 1), 12: last_contact, 13: geohash, 14: fir,
- *   15: registration, 16: aircraft_code, 17: aircraft_model
+ *   15: registration, 16: aircraft_code, 17: aircraft_model, 18: isHelicopter
  * ]
  */
 export type CompactAircraftTuple = [
@@ -114,7 +115,8 @@ export type CompactAircraftTuple = [
   ChileanFIRCode,
   string,
   string,
-  string
+  string,
+  boolean
 ];
 
 export type ServerWSMessage =

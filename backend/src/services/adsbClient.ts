@@ -109,7 +109,105 @@ const ICAO_AIRCRAFT_MODELS: Record<string, { model: string; category: AirframeCa
   PA31: { model: 'Piper PA-31 Navajo', category: 'turboprop' },
   C130: { model: 'Lockheed C-130H Hercules', category: 'turboprop' },
   C30J: { model: 'Lockheed Martin C-130J Super Hercules', category: 'turboprop' },
+  // Rotorcraft / Helicopters
+  B06: { model: 'Bell 206 JetRanger', category: 'helicopter' },
+  B06T: { model: 'Bell 206LT TwinRanger', category: 'helicopter' },
+  B212: { model: 'Bell 212 Twin Two-Twelve', category: 'helicopter' },
+  B407: { model: 'Bell 407GXi', category: 'helicopter' },
+  B412: { model: 'Bell 412EP', category: 'helicopter' },
+  B429: { model: 'Bell 429 GlobalRanger', category: 'helicopter' },
+  B505: { model: 'Bell 505 Jet Ranger X', category: 'helicopter' },
+  AS50: { model: 'Airbus H125 Écureuil (AS350)', category: 'helicopter' },
+  AS55: { model: 'Airbus AS355 Écureuil 2', category: 'helicopter' },
+  AS32: { model: 'Airbus AS332 Super Puma', category: 'helicopter' },
+  EC20: { model: 'Airbus H120 Colibri (EC120)', category: 'helicopter' },
+  EC25: { model: 'Airbus H225 Super Puma', category: 'helicopter' },
+  EC30: { model: 'Airbus H130 (EC130)', category: 'helicopter' },
+  EC35: { model: 'Airbus H135 (EC135)', category: 'helicopter' },
+  EC45: { model: 'Airbus H145 (EC145)', category: 'helicopter' },
+  EC55: { model: 'Airbus H155 (EC155)', category: 'helicopter' },
+  H160: { model: 'Airbus H160', category: 'helicopter' },
+  S70: { model: 'Sikorsky S-70 / UH-60 Black Hawk', category: 'helicopter' },
+  H60: { model: 'Sikorsky UH-60 Black Hawk', category: 'helicopter' },
+  S76: { model: 'Sikorsky S-76C++', category: 'helicopter' },
+  S92: { model: 'Sikorsky S-92A Helibus', category: 'helicopter' },
+  H47: { model: 'Boeing CH-47F Chinook', category: 'helicopter' },
+  H64: { model: 'Boeing AH-64E Apache', category: 'helicopter' },
+  R22: { model: 'Robinson R22 Beta II', category: 'helicopter' },
+  R44: { model: 'Robinson R44 Raven II', category: 'helicopter' },
+  R66: { model: 'Robinson R66 Turbine', category: 'helicopter' },
+  A109: { model: 'Leonardo AW109SP GrandNew', category: 'helicopter' },
+  A119: { model: 'Leonardo AW119Kx Koala', category: 'helicopter' },
+  A139: { model: 'Leonardo AW139', category: 'helicopter' },
+  AW139: { model: 'Leonardo AW139', category: 'helicopter' },
+  A169: { model: 'Leonardo AW169', category: 'helicopter' },
+  A189: { model: 'Leonardo AW189', category: 'helicopter' },
+  BK17: { model: 'MBB/Kawasaki BK117', category: 'helicopter' },
+  BO10: { model: 'MBB Bo 105', category: 'helicopter' },
+  H500: { model: 'MD 500E Defender', category: 'helicopter' },
+  MD52: { model: 'MD 520N NOTAR', category: 'helicopter' },
+  G2CA: { model: 'Guimbal Cabri G2', category: 'helicopter' },
 };
+
+const HELICOPTER_ICAO_CODES = new Set<string>([
+  'B06', 'B06T', 'B206', 'B212', 'B222', 'B230', 'B407', 'B412', 'B427', 'B429', 'B430', 'B505', 'B525',
+  'AS32', 'AS3B', 'AS50', 'AS55', 'AS65', 'EC20', 'EC25', 'EC30', 'EC35', 'EC45', 'EC55', 'EC75',
+  'H125', 'H130', 'H135', 'H145', 'H155', 'H160', 'H175', 'H215', 'H225',
+  'S58T', 'S61', 'S61R', 'S64', 'S70', 'S76', 'S92', 'H60', 'UH60', 'SH60', 'HH60', 'MH60',
+  'CH47', 'H47', 'CH53', 'H53', 'AH64', 'H64', 'AH1', 'UH1', 'BELL', 'HELI',
+  'R22', 'R44', 'R66',
+  'A109', 'A119', 'A139', 'AW139', 'A149', 'A169', 'A189', 'AW09', 'AW109', 'AW119', 'AW169', 'AW189', 'EH10', 'AW101',
+  'MD52', 'MD60', 'EXPL', 'H500', 'MD500', 'NOTR', 'EXEC', 'EN28', 'EN48', 'G2CA', 'CABR', 'S300', 'H269',
+  'KMAX', 'KA27', 'KA32', 'MI8', 'MI17', 'MI24', 'MI26', 'MI28', 'MI38', 'ALH', 'BK17', 'BO10', 'BO105',
+  'GAZL', 'SA30', 'SA31', 'SA32', 'SA33', 'SA34', 'SA36', 'PUMA', 'LAMA', 'ALOU', 'V22',
+]);
+
+export function detectIsHelicopter(
+  emitterCategory: unknown,
+  typeCode?: string,
+  rawDesc?: string
+): boolean {
+  if (
+    emitterCategory === 'A7' ||
+    emitterCategory === 7 ||
+    (typeof emitterCategory === 'string' && emitterCategory.trim().toUpperCase() === 'A7')
+  ) {
+    return true;
+  }
+
+  const cleanCode = (typeCode || '').trim().toUpperCase();
+  if (cleanCode && HELICOPTER_ICAO_CODES.has(cleanCode)) {
+    return true;
+  }
+
+  if (rawDesc) {
+    const upperDesc = rawDesc.toUpperCase();
+    if (
+      upperDesc.includes('HELICOPTER') ||
+      upperDesc.includes('ROTORCRAFT') ||
+      upperDesc.includes('GYROCOPTER') ||
+      upperDesc.includes('BELL 206') ||
+      upperDesc.includes('BELL 407') ||
+      upperDesc.includes('BELL 412') ||
+      upperDesc.includes('BELL 429') ||
+      upperDesc.includes('BELL 505') ||
+      upperDesc.includes('EUROCOPTER') ||
+      upperDesc.includes('ECUREUIL') ||
+      upperDesc.includes('BLACK HAWK') ||
+      upperDesc.includes('SIKORSKY') ||
+      upperDesc.includes('ROBINSON R') ||
+      upperDesc.includes('AGUSTA') ||
+      upperDesc.includes('AW139') ||
+      upperDesc.includes('AW109') ||
+      upperDesc.includes('CHINOOK') ||
+      upperDesc.includes('SUPER PUMA')
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 export function resolveAircraftModelInfo(
   typeCode?: string,
@@ -150,6 +248,9 @@ export function resolveAircraftModelInfo(
 }
 
 function inferCategoryFromCodeOrDesc(code: string, desc: string): AirframeCategory {
+  if (detectIsHelicopter(null, code, desc)) {
+    return 'helicopter';
+  }
   const upper = `${code} ${desc}`.toUpperCase();
   if (
     upper.includes('747') ||
@@ -480,6 +581,9 @@ export class ADSBClient {
         const callsign = rawFlight || reg || hex.toUpperCase();
 
         const modelInfo = resolveAircraftModelInfo(typeCode, rawDesc);
+        const isHelicopter =
+          modelInfo.category === 'helicopter' ||
+          detectIsHelicopter(item.category, typeCode, rawDesc);
 
         const altBaroFt = typeof item.alt_baro === 'number' ? item.alt_baro : 0;
         const altGeomFt = typeof item.alt_geom === 'number' ? item.alt_geom : altBaroFt;
@@ -515,6 +619,7 @@ export class ADSBClient {
           registration: reg || undefined,
           aircraft_code: modelInfo.code,
           aircraft_model: modelInfo.model,
+          isHelicopter,
         });
       }
     }
@@ -565,6 +670,8 @@ export class ADSBClient {
       const originLabel = routeTag ? `${country} (${routeTag})` : country;
 
       const modelInfo = resolveAircraftModelInfo(acType);
+      const isHelicopter =
+        modelInfo.category === 'helicopter' || detectIsHelicopter(null, acType);
 
       const baroMeters = Math.max(0, Math.round(altFt * 0.3048));
       const geoMeters = baroMeters > 0 ? baroMeters + 115 : 0;
@@ -591,6 +698,7 @@ export class ADSBClient {
         registration: reg || undefined,
         aircraft_code: modelInfo.code,
         aircraft_model: modelInfo.model,
+        isHelicopter,
       });
     }
 
@@ -698,6 +806,8 @@ export class ADSBClient {
         const geoAlt = typeof tuple[13] === 'number' ? tuple[13] : baroAlt;
         const rawSquawk = typeof tuple[14] === 'string' && tuple[14].trim() ? tuple[14].trim() : null;
         const squawk = this.squawkOverrides.get(icao24) ?? rawSquawk;
+        const emitterCategory = tuple[17];
+        const isHelicopter = detectIsHelicopter(emitterCategory);
 
         // Store all global aircraft without geographic filtering
         normalized.push({
@@ -718,6 +828,7 @@ export class ADSBClient {
           fir: classifyChileanFIR(lat, lon),
           source: 'opensky',
           server_timestamp: now,
+          isHelicopter,
         });
       }
 
@@ -764,6 +875,7 @@ export class ADSBClient {
         aircraft_model: ac.aircraft_model || existing?.aircraft_model,
         aircraft_code: ac.aircraft_code || existing?.aircraft_code,
         registration: ac.registration || existing?.registration,
+        isHelicopter: Boolean(ac.isHelicopter || existing?.isHelicopter),
       });
     }
 
