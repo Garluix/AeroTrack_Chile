@@ -54,10 +54,15 @@ export interface AircraftPhotoMetadata {
 }
 
 /**
- * Extended client-side kinematic entity used by the 60 FPS requestAnimationFrame
- * Dead Reckoning & Spherical Great Circle interpolation loop.
+ * Extended client-side kinematic entity used by the 60/120 FPS requestAnimationFrame
+ * Dead Reckoning & Spherical Great Circle interpolation loop:
+ *   P(t) = P_anterior + (P_objetivo(t) - P_anterior) * alpha
  */
 export interface KinematicAircraft extends AircraftTelemetry {
+  // Raw transponder coordinates from the last upstream packet (to detect duplicate fixes)
+  rawLat: number;
+  rawLon: number;
+
   // Last authoritative telemetry anchor P_0 received via WebSocket
   anchorLat: number;
   anchorLon: number;
@@ -65,7 +70,9 @@ export interface KinematicAircraft extends AircraftTelemetry {
   anchorTrack: number;
   anchorTimestampMs: number;
 
-  // Smoothly interpolated render coordinates P_t at 60 FPS (never teleports)
+  // Previous rendered coordinate P_anterior and current interpolated coordinate P(t)
+  prevLat: number;
+  prevLon: number;
   renderLat: number;
   renderLon: number;
   renderAlt: number;
@@ -94,6 +101,36 @@ export interface SystemMetrics {
   activeGeohashes: string[];
 }
 
+/**
+ * Compact WebSocket Wire Tuple matching backend CompactAircraftTuple:
+ * [
+ *   0: icao24, 1: callsign, 2: origin_country, 3: lat, 4: lon,
+ *   5: baro_altitude, 6: geo_altitude, 7: velocity, 8: true_track, 9: vertical_rate,
+ *   10: squawk, 11: on_ground (0 | 1), 12: last_contact, 13: geohash, 14: fir,
+ *   15: registration, 16: aircraft_code, 17: aircraft_model
+ * ]
+ */
+export type CompactAircraftTuple = [
+  string,
+  string,
+  string,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  string | null,
+  0 | 1,
+  number,
+  string,
+  ChileanFIRCode,
+  string,
+  string,
+  string
+];
+
 export type ServerWSMessage =
   | {
       type: 'telemetry_batch';
@@ -101,8 +138,10 @@ export type ServerWSMessage =
       source: 'opensky' | 'adsbfi' | 'hybrid' | 'synthetic';
       activeBbox: BoundingBox;
       geohashPrefixes: string[];
-      aircraft: AircraftTelemetry[];
+      tuples?: CompactAircraftTuple[];
+      aircraft?: AircraftTelemetry[];
       removedIds: string[];
+      totalGlobalCount?: number;
     }
   | {
       type: 'aircraft_trail';

@@ -116,36 +116,108 @@ export function lerpAngleDeg(currentDeg: number, targetDeg: number, alpha: numbe
 }
 
 /**
- * Advances a single KinematicAircraft in-place for the current animation frame:
- * 1. Projects target coordinate P_t from the last authoritative state P_0 using Great Circle kinematics.
- * 2. Applies exponential error decay (1 - exp(-lambda * frameDt)) via Spherical Linear Interpolation (Slerp)
- *    from the current rendered coordinate toward P_t so the entity NEVER teleports when a new WS packet arrives.
+ * Computes the signed along-track time offset (seconds) between the current rendered coordinate
+ * (renderLat, renderLon) and a newly arrived transponder fix (fixLat, fixLon) along trueTrackDeg.
+ * Prevents backward rubber-banding ("stuttering") when an upstream ADS-B feed delivers a fix
+ * that is 0.5s - 3.5s older than our current client-side Dead Reckoning projection.
+ */
+export function computeMonotonicAnchorTimestamp(
+  renderLat: number,
+  renderLon: number,
+  fixLat: number,
+  fixLon: number,
+  velocityMs: number,
+  trueTrackDeg: number,
+  nowMs: number
+): number {
+  if (velocityMs < 5.0) {
+    return nowMs;
+  }
+
+  const meanLatRad = ((renderLat + fixLat) * 0.5) * DEG_TO_RAD;
+  const dNorthMeters = (fixLat - renderLat) * DEG_TO_RAD * EARTH_RADIUS_M;
+  const dEastMeters = (fixLon - renderLon) * DEG_TO_RAD * EARTH_RADIUS_M * Math.cos(meanLatRad);
+
+  const totalDistMeters = Math.hypot(dNorthMeters, dEastMeters);
+  // If the aircraft jumped > 12 km (e.g. initial spawn or major course/sensor reset), use nowMs directly
+  if (totalDistMeters > 12000) {
+    return nowMs;
+  }
+
+  const theta = trueTrackDeg * DEG_TO_RAD;
+  const trackEast = Math.sin(theta);
+  const trackNorth = Math.cos(theta);
+
+  // Signed distance from renderPosition to newFix along the heading vector:
+  // If < 0, the newly received transponder fix is slightly BEHIND our current rendered position.
+  const alongTrackMeters = dEastMeters * trackEast + dNorthMeters * trackNorth;
+
+  if (alongTrackMeters < 0) {
+    // Advance the virtual anchor timestamp into the past so P_objetivo(nowMs) is at least flush
+    // with the current rendered position along-track, eliminating any backward snap!
+    const lagSec = Math.min(8.0, Math.abs(alongTrackMeters) / velocityMs);
+    return nowMs - lagSec * 1000.0;
+  }
+
+  return nowMs;
+}
+
+/**
+ * Advances a single KinematicAircraft in-place for the current animation frame (60/120 FPS):
+ * Implements continuous Spherical/Linear Lerp with Dead Reckoning:
+ *   P(t) = P_anterior + (P_objetivo(t) - P_anterior) * alpha
+ * where alpha is computed as a function of frameDtSec (Delta t).
  */
 export function stepAircraftKinematics(
   ac: KinematicAircraft,
   nowMs: number,
-  frameDtSec: number
+  frameDtSec: number,
+  highDetail = true
 ): void {
+  ac.prevLat = ac.renderLat;
+  ac.prevLon = ac.renderLon;
+
   if (ac.on_ground || ac.velocity < 1.0) {
-    const blend = 1.0 - Math.exp(-6.0 * frameDtSec);
-    const [nextLat, nextLon] = slerpGeoPosition(
-      ac.renderLat,
-      ac.renderLon,
-      ac.anchorLat,
-      ac.anchorLon,
-      blend
-    );
-    ac.renderLat = nextLat;
-    ac.renderLon = nextLon;
-    ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, blend);
+    const alpha = Math.min(1.0, 1.0 - Math.exp(-6.0 * frameDtSec));
+    ac.renderLat = ac.prevLat + (ac.anchorLat - ac.prevLat) * alpha;
+    ac.renderLon = ac.prevLon + (ac.anchorLon - ac.prevLon) * alpha;
+    ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, alpha);
     return;
   }
 
-  // Time elapsed since the authoritative anchor state was captured
-  const elapsedSinceAnchorSec = Math.max(0, (nowMs - ac.anchorTimestampMs) / 1000.0);
+  // 1. Smoothly interpolate heading first so velocity integration follows the curved flight path
+  const trackAlpha = Math.min(1.0, 1.0 - Math.exp(-5.5 * frameDtSec));
+  ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, trackAlpha);
 
-  // Project ideal Dead Reckoning position along the Great Circle
-  const [projectedLat, projectedLon] = projectGreatCirclePosition(
+  // 2. Time elapsed since the authoritative anchor state was captured
+  const elapsedSinceAnchorSec = Math.min(25.0, Math.max(0, (nowMs - ac.anchorTimestampMs) / 1000.0));
+  const alpha = Math.min(1.0, 1.0 - Math.exp(-4.2 * frameDtSec));
+
+  if (!highDetail) {
+    // Fast cosine-corrected geodesic Dead Reckoning + Linear Lerp for continental/world view (12,000+ entities)
+    const thetaRad = ac.true_track * DEG_TO_RAD;
+    const cosLat = Math.max(0.15, Math.cos(ac.anchorLat * DEG_TO_RAD));
+    const degPerMeterLat = RAD_TO_DEG / EARTH_RADIUS_M;
+    const degPerMeterLon = degPerMeterLat / cosLat;
+
+    const vNorth = ac.velocity * Math.cos(thetaRad);
+    const vEast = ac.velocity * Math.sin(thetaRad);
+
+    const targetLat = ac.anchorLat + vNorth * elapsedSinceAnchorSec * degPerMeterLat;
+    const targetLon = ac.anchorLon + vEast * elapsedSinceAnchorSec * degPerMeterLon;
+
+    const anteriorLat = ac.prevLat + vNorth * frameDtSec * degPerMeterLat;
+    const anteriorLon = ac.prevLon + vEast * frameDtSec * degPerMeterLon;
+
+    ac.renderLat = anteriorLat + (targetLat - anteriorLat) * alpha;
+    ac.renderLon = anteriorLon + (targetLon - anteriorLon) * alpha;
+    const targetAlt = Math.max(0, ac.anchorAlt + ac.vertical_rate * elapsedSinceAnchorSec);
+    ac.renderAlt = ac.renderAlt + (targetAlt - ac.renderAlt) * alpha;
+    return;
+  }
+
+  // 3. High-detail 3D Great Circle Slerp for regional/tactical zoom & locked aircraft
+  const [targetLat, targetLon] = projectGreatCirclePosition(
     ac.anchorLat,
     ac.anchorLon,
     ac.velocity,
@@ -153,32 +225,27 @@ export function stepAircraftKinematics(
     elapsedSinceAnchorSec
   );
 
-  // Also advance current render position forward along its current renderTrack by frameDtSec
-  const [steppedRenderLat, steppedRenderLon] = projectGreatCirclePosition(
-    ac.renderLat,
-    ac.renderLon,
+  const [anteriorLat, anteriorLon] = projectGreatCirclePosition(
+    ac.prevLat,
+    ac.prevLon,
     ac.velocity,
     ac.renderTrack,
     frameDtSec
   );
 
-  // Exponential error decay factor (lambda = 3.2 s^-1 provides silky convergence over ~0.8s without snapping)
-  const errorDecayAlpha = 1.0 - Math.exp(-3.2 * frameDtSec);
-
   const [smoothedLat, smoothedLon] = slerpGeoPosition(
-    steppedRenderLat,
-    steppedRenderLon,
-    projectedLat,
-    projectedLon,
-    errorDecayAlpha
+    anteriorLat,
+    anteriorLon,
+    targetLat,
+    targetLon,
+    alpha
   );
 
   ac.renderLat = smoothedLat;
   ac.renderLon = smoothedLon;
-  ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, 1.0 - Math.exp(-5.0 * frameDtSec));
 
   const targetAlt = Math.max(0, ac.anchorAlt + ac.vertical_rate * elapsedSinceAnchorSec);
-  ac.renderAlt = ac.renderAlt + (targetAlt - ac.renderAlt) * errorDecayAlpha;
+  ac.renderAlt = ac.renderAlt + (targetAlt - ac.renderAlt) * alpha;
 }
 
 /**
@@ -286,6 +353,64 @@ export function getAltitudeColorRGBA(
       Math.round(247 + (182 - 247) * t),
       255,
     ];
+  }
+}
+
+/**
+ * Zero-allocation RGBA writer directly into a pre-allocated Uint8Array buffer
+ * for Deck.gl instanced WebGL rendering of 10,000+ simultaneous aircraft.
+ */
+export function writeAltitudeColorRGBA(
+  target: Uint8Array,
+  offset: number,
+  altitudeMeters: number,
+  squawk?: string | null,
+  isSelected?: boolean,
+  pulsePhase = 1.0
+): void {
+  if (isEmergencySquawk(squawk)) {
+    target[offset] = 255;
+    target[offset + 1] = Math.round(45 * (1 - pulsePhase));
+    target[offset + 2] = Math.round(65 * (1 - pulsePhase));
+    target[offset + 3] = Math.round(195 + 60 * pulsePhase);
+    return;
+  }
+
+  if (isSelected) {
+    target[offset] = 250;
+    target[offset + 1] = 204;
+    target[offset + 2] = 21;
+    target[offset + 3] = 255;
+    return;
+  }
+
+  const clamped = altitudeMeters < 0 ? 0 : altitudeMeters > 13000 ? 13000 : altitudeMeters;
+  const ratio = clamped / 13000;
+
+  if (ratio < 0.25) {
+    const t = ratio / 0.25;
+    target[offset] = (16 + (6 - 16) * t) | 0;
+    target[offset + 1] = (185 + (182 - 185) * t) | 0;
+    target[offset + 2] = (129 + (212 - 129) * t) | 0;
+    target[offset + 3] = 245;
+  } else if (ratio < 0.6) {
+    const t = (ratio - 0.25) / 0.35;
+    target[offset] = (6 + (56 - 6) * t) | 0;
+    target[offset + 1] = (182 + (189 - 182) * t) | 0;
+    target[offset + 2] = (212 + (248 - 212) * t) | 0;
+    target[offset + 3] = 245;
+  } else if (ratio < 0.85) {
+    const t = (ratio - 0.6) / 0.25;
+    target[offset] = (56 + (168 - 56) * t) | 0;
+    target[offset + 1] = (189 + (85 - 189) * t) | 0;
+    target[offset + 2] = (248 + (247 - 248) * t) | 0;
+    target[offset + 3] = 250;
+  } else {
+    const t = (ratio - 0.85) / 0.15;
+    target[offset] = (168 + (244 - 168) * t) | 0;
+    target[offset + 1] = (85 + (114 - 85) * t) | 0;
+    target[offset + 2] = (247 + (182 - 247) * t) | 0;
+    target[offset + 3] = 255;
   }
 }
 
