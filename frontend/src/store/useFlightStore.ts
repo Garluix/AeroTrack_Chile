@@ -3,11 +3,13 @@ import {
   AircraftTelemetry,
   BoundingBox,
   ChileanFIRCode,
+  CompactAircraftTuple,
   FIRDefinition,
   KinematicAircraft,
   SystemMetrics,
   TrailBreadcrumb,
 } from '../types/telemetry';
+import { computeMonotonicAnchorTimestamp } from '../utils/kinematics';
 
 export interface CameraTarget {
   lat: number;
@@ -19,7 +21,7 @@ export interface CameraTarget {
 }
 
 interface FlightStoreState {
-  // Authoritative kinematic map mutated in-place at 60 FPS by useDeadReckoning
+  // Authoritative kinematic map mutated in-place at 60/120 FPS by useDeadReckoning (outside React state reconciliation)
   kinematicMap: Map<string, KinematicAircraft>;
   // Lightweight version counter bumped only on discrete WebSocket batch arrivals
   batchVersion: number;
@@ -45,11 +47,13 @@ interface FlightStoreState {
 
   // Actions
   ingestTelemetryBatch: (
-    aircraft: AircraftTelemetry[],
+    tuples: CompactAircraftTuple[] | undefined,
+    aircraft: AircraftTelemetry[] | undefined,
     removedIds: string[],
     activeBbox: BoundingBox,
     geohashPrefixes: string[],
-    source: string
+    source: string,
+    totalGlobalCount?: number
   ) => void;
   setSelectedIcao24: (icao24: string | null) => void;
   syncSelectedSnapshot: () => void;
@@ -71,6 +75,76 @@ const DEFAULT_CHILE_BBOX: BoundingBox = {
   lomax: -66.0,
 };
 
+function upsertKinematicEntity(
+  map: Map<string, KinematicAircraft>,
+  frame: AircraftTelemetry,
+  nowMs: number
+): void {
+  const existing = map.get(frame.icao24);
+  if (existing) {
+    const posChanged =
+      Math.abs(frame.lat - existing.rawLat) > 1e-5 ||
+      Math.abs(frame.lon - existing.rawLon) > 1e-5;
+
+    existing.callsign = frame.callsign;
+    existing.origin_country = frame.origin_country;
+    existing.lat = frame.lat;
+    existing.lon = frame.lon;
+    existing.baro_altitude = frame.baro_altitude;
+    existing.geo_altitude = frame.geo_altitude;
+    existing.velocity = frame.velocity;
+    existing.true_track = frame.true_track;
+    existing.vertical_rate = frame.vertical_rate;
+    existing.squawk = frame.squawk;
+    existing.on_ground = frame.on_ground;
+    existing.last_contact = frame.last_contact;
+    existing.geohash = frame.geohash;
+    existing.fir = frame.fir;
+    existing.source = frame.source;
+    existing.server_timestamp = frame.server_timestamp;
+    if (frame.registration) existing.registration = frame.registration;
+    if (frame.aircraft_code) existing.aircraft_code = frame.aircraft_code;
+    if (frame.aircraft_model) existing.aircraft_model = frame.aircraft_model;
+
+    // Only update the Dead Reckoning anchor when the transponder actually reported a NEW coordinate!
+    // This prevents backward rubber-banding when cached/duplicate packets arrive.
+    if (posChanged) {
+      existing.rawLat = frame.lat;
+      existing.rawLon = frame.lon;
+      existing.anchorLat = frame.lat;
+      existing.anchorLon = frame.lon;
+      existing.anchorAlt = frame.baro_altitude;
+      existing.anchorTrack = frame.true_track;
+      existing.anchorTimestampMs = computeMonotonicAnchorTimestamp(
+        existing.renderLat,
+        existing.renderLon,
+        frame.lat,
+        frame.lon,
+        frame.velocity,
+        frame.true_track,
+        nowMs
+      );
+    }
+  } else {
+    map.set(frame.icao24, {
+      ...frame,
+      rawLat: frame.lat,
+      rawLon: frame.lon,
+      anchorLat: frame.lat,
+      anchorLon: frame.lon,
+      anchorAlt: frame.baro_altitude,
+      anchorTrack: frame.true_track,
+      anchorTimestampMs: nowMs,
+      prevLat: frame.lat,
+      prevLon: frame.lon,
+      renderLat: frame.lat,
+      renderLon: frame.lon,
+      renderAlt: frame.baro_altitude,
+      renderTrack: frame.true_track,
+    });
+  }
+}
+
 export const useFlightStore = create<FlightStoreState>((set, get) => ({
   kinematicMap: new Map<string, KinematicAircraft>(),
   batchVersion: 0,
@@ -91,7 +165,7 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
   metrics: {
     connectedClients: 1,
     totalTrackedAircraft: 0,
-    upstreamSource: 'hybrid',
+    upstreamSource: 'adsbfi',
     rateLimitRemaining: 400,
     redisConnected: false,
     pollingIntervalMs: 6000,
@@ -101,69 +175,78 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
     activeGeohashes: [],
   },
 
-  ingestTelemetryBatch: (aircraft, removedIds, activeBbox, geohashPrefixes, source) => {
+  ingestTelemetryBatch: (
+    tuples,
+    aircraft,
+    removedIds,
+    activeBbox,
+    geohashPrefixes,
+    source,
+    totalGlobalCount
+  ) => {
     const map = get().kinematicMap;
     const nowMs = performance.now();
+    const serverNow = Date.now();
+    const normalizedSource: 'opensky' | 'adsbfi' | 'synthetic' =
+      source === 'opensky' ? 'opensky' : 'adsbfi';
 
-    for (const id of removedIds) {
-      map.delete(id);
+    for (let i = 0; i < removedIds.length; i++) {
+      map.delete(removedIds[i]);
     }
 
-    for (const frame of aircraft) {
-      const existing = map.get(frame.icao24);
-      if (existing) {
-        // Update authoritative anchor P_0 while preserving current renderLat/renderLon
-        // so exponential Dead Reckoning smoothly converges without teleportation!
-        existing.callsign = frame.callsign;
-        existing.origin_country = frame.origin_country;
-        existing.lat = frame.lat;
-        existing.lon = frame.lon;
-        existing.baro_altitude = frame.baro_altitude;
-        existing.geo_altitude = frame.geo_altitude;
-        existing.velocity = frame.velocity;
-        existing.true_track = frame.true_track;
-        existing.vertical_rate = frame.vertical_rate;
-        existing.squawk = frame.squawk;
-        existing.on_ground = frame.on_ground;
-        existing.last_contact = frame.last_contact;
-        existing.geohash = frame.geohash;
-        existing.fir = frame.fir;
-        existing.source = frame.source;
-        existing.server_timestamp = frame.server_timestamp;
-        existing.registration = frame.registration || existing.registration;
-        existing.aircraft_code = frame.aircraft_code || existing.aircraft_code;
-        existing.aircraft_model = frame.aircraft_model || existing.aircraft_model;
+    // 1. Decode compact flat tuples [icao24, callsign, origin_country, lat, lon, ...]
+    if (tuples && tuples.length > 0) {
+      for (let i = 0; i < tuples.length; i++) {
+        const t = tuples[i];
+        upsertKinematicEntity(
+          map,
+          {
+            icao24: t[0],
+            callsign: t[1],
+            origin_country: t[2],
+            lat: t[3],
+            lon: t[4],
+            baro_altitude: t[5],
+            geo_altitude: t[6],
+            velocity: t[7],
+            true_track: t[8],
+            vertical_rate: t[9],
+            squawk: t[10],
+            on_ground: t[11] === 1,
+            last_contact: t[12],
+            geohash: t[13],
+            fir: t[14],
+            source: normalizedSource,
+            server_timestamp: serverNow,
+            registration: t[15] || undefined,
+            aircraft_code: t[16] || undefined,
+            aircraft_model: t[17] || undefined,
+          },
+          nowMs
+        );
+      }
+    }
 
-        existing.anchorLat = frame.lat;
-        existing.anchorLon = frame.lon;
-        existing.anchorAlt = frame.baro_altitude;
-        existing.anchorTrack = frame.true_track;
-        existing.anchorTimestampMs = nowMs;
-      } else {
-        map.set(frame.icao24, {
-          ...frame,
-          anchorLat: frame.lat,
-          anchorLon: frame.lon,
-          anchorAlt: frame.baro_altitude,
-          anchorTrack: frame.true_track,
-          anchorTimestampMs: nowMs,
-          renderLat: frame.lat,
-          renderLon: frame.lon,
-          renderAlt: frame.baro_altitude,
-          renderTrack: frame.true_track,
-        });
+    // 2. Fallback support if verbose aircraft objects were sent
+    if (aircraft && aircraft.length > 0) {
+      for (let i = 0; i < aircraft.length; i++) {
+        upsertKinematicEntity(map, aircraft[i], nowMs);
       }
     }
 
     const selId = get().selectedIcao24;
     const selAc = selId ? map.get(selId) ?? null : null;
+    const trackedCount =
+      typeof totalGlobalCount === 'number' && totalGlobalCount > map.size
+        ? totalGlobalCount
+        : map.size;
 
     set((state) => ({
       batchVersion: state.batchVersion + 1,
       selectedAircraftSnapshot: selAc ? { ...selAc } : null,
       metrics: {
         ...state.metrics,
-        totalTrackedAircraft: map.size,
+        totalTrackedAircraft: trackedCount,
         activeBbox,
         activeGeohashes: geohashPrefixes,
         upstreamSource: source,
@@ -178,6 +261,7 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
       selectedIcao24: normalized,
       selectedAircraftSnapshot: ac ? { ...ac } : null,
       selectedTrail: normalized ? get().selectedTrail : [],
+      followSelectedAircraft: normalized ? get().followSelectedAircraft : false,
     });
   },
 
@@ -198,7 +282,8 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
 
   setFirs: (firs) => set({ firs }),
   setShowFIRBoundaries: (showFIRBoundaries) => set({ showFIRBoundaries }),
-  setActiveFIRFilter: (activeFIRFilter) => set({ activeFIRFilter }),
+  setActiveFIRFilter: (activeFIRFilter) =>
+    set({ activeFIRFilter, followSelectedAircraft: false }),
   setSearchQuery: (searchQuery) => set({ searchQuery }),
   setFollowSelectedAircraft: (followSelectedAircraft) => set({ followSelectedAircraft }),
   flyTo: (target) => set({ cameraTarget: { ...target, timestamp: Date.now() } }),

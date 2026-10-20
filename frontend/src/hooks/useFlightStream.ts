@@ -87,11 +87,13 @@ export function useFlightStream() {
         switch (msg.type) {
           case 'telemetry_batch':
             ingestTelemetryBatch(
+              msg.tuples,
               msg.aircraft,
               msg.removedIds,
               msg.activeBbox,
               msg.geohashPrefixes,
-              msg.source
+              msg.source,
+              msg.totalGlobalCount
             );
             break;
 
