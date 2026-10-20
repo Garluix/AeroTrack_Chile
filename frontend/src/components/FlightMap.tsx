@@ -94,6 +94,34 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   const viewportDebounceRef = useRef<number | null>(null);
 
+  // Mutable geospatial frustum bounds & zoom for GPU Frustum Culling (updated without React re-renders)
+  const frustumBoundsRef = useRef<BoundingBox | null>(null);
+  const currentZoomRef = useRef<number>(INITIAL_ZOOM);
+
+  // Track last emitted viewport to avoid spamming WS viewport_changed during 60 FPS Camera Lock
+  const lastEmittedViewportRef = useRef<{
+    lat: number;
+    lon: number;
+    zoom: number;
+    timeMs: number;
+  }>({
+    lat: INITIAL_LAT,
+    lon: INITIAL_LON,
+    zoom: INITIAL_ZOOM,
+    timeMs: 0,
+  });
+
+  // Smoothly dampened camera coordinates for Camera Lock ("Modo Seguimiento")
+  const dampedCameraRef = useRef<{
+    lon: number;
+    lat: number;
+    lockedId: string | null;
+  }>({
+    lon: INITIAL_LON,
+    lat: INITIAL_LAT,
+    lockedId: null,
+  });
+
   const [basemapMode, setBasemapMode] = useState<BasemapMode>('osm-dark');
   const [hoveredAircraft, setHoveredAircraft] = useState<{
     x: number;
@@ -130,11 +158,44 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
       'bottom-right'
     );
 
+    const syncFrustumBounds = () => {
+      const b = map.getBounds();
+      currentZoomRef.current = map.getZoom();
+      const latSpan = Math.max(1.0, b.getNorth() - b.getSouth());
+      const lonSpan = Math.max(1.0, b.getEast() - b.getWest());
+      const latPad = latSpan * 0.12;
+      const lonPad = lonSpan * 0.12;
+      frustumBoundsRef.current = {
+        lamin: Math.max(-85, b.getSouth() - latPad),
+        lomin: Math.max(-180, b.getWest() - lonPad),
+        lamax: Math.min(85, b.getNorth() + latPad),
+        lomax: Math.min(180, b.getEast() + lonPad),
+      };
+    };
+
     const emitBounds = () => {
-      if (viewportDebounceRef.current) {
-        window.clearTimeout(viewportDebounceRef.current);
-      }
-      viewportDebounceRef.current = window.setTimeout(() => {
+      syncFrustumBounds();
+
+      const isFollowing = useFlightStore.getState().followSelectedAircraft;
+      const now = performance.now();
+      const center = map.getCenter();
+      const zoom = map.getZoom();
+      const last = lastEmittedViewportRef.current;
+
+      const distMovedDeg = Math.hypot(center.lat - last.lat, center.lng - last.lon);
+      const zoomDiff = Math.abs(zoom - last.zoom);
+
+      // During 60/120 FPS Camera Lock, do NOT spam WS viewport_changed on every frame
+      if (isFollowing) {
+        if (now - last.timeMs < 5000 && distMovedDeg < 1.5 && zoomDiff < 0.6) {
+          return;
+        }
+        lastEmittedViewportRef.current = {
+          lat: center.lat,
+          lon: center.lng,
+          zoom,
+          timeMs: now,
+        };
         const bounds = map.getBounds();
         onViewportChanged(
           {
@@ -143,19 +204,55 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
             lamax: Number(bounds.getNorth().toFixed(3)),
             lomax: Number(bounds.getEast().toFixed(3)),
           },
-          Number(map.getZoom().toFixed(2))
+          Number(zoom.toFixed(2))
+        );
+        return;
+      }
+
+      if (viewportDebounceRef.current) {
+        window.clearTimeout(viewportDebounceRef.current);
+      }
+      viewportDebounceRef.current = window.setTimeout(() => {
+        const bounds = map.getBounds();
+        const c = map.getCenter();
+        const z = map.getZoom();
+        lastEmittedViewportRef.current = {
+          lat: c.lat,
+          lon: c.lng,
+          zoom: z,
+          timeMs: performance.now(),
+        };
+        onViewportChanged(
+          {
+            lamin: Number(bounds.getSouth().toFixed(3)),
+            lomin: Number(bounds.getWest().toFixed(3)),
+            lamax: Number(bounds.getNorth().toFixed(3)),
+            lomax: Number(bounds.getEast().toFixed(3)),
+          },
+          Number(z.toFixed(2))
         );
       }, 280);
     };
 
+    // Disengage Camera Lock if the user manually drags the map canvas
+    const handleDragStart = () => {
+      if (useFlightStore.getState().followSelectedAircraft) {
+        useFlightStore.getState().setFollowSelectedAircraft(false);
+      }
+    };
+
     map.on('load', emitBounds);
+    map.on('move', syncFrustumBounds);
     map.on('moveend', emitBounds);
+    map.on('dragstart', handleDragStart);
 
     mapRef.current = map;
     deckOverlayRef.current = deckOverlay;
 
     return () => {
       if (viewportDebounceRef.current) window.clearTimeout(viewportDebounceRef.current);
+      map.off('dragstart', handleDragStart);
+      map.off('move', syncFrustumBounds);
       map.remove();
       mapRef.current = null;
       deckOverlayRef.current = null;
@@ -175,182 +272,254 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
     }
   };
 
-  // Smooth camera transitions when user selects a FIR sector or Global preset
+  // Smooth camera transitions when user selects a FIR sector, Global preset, or "Centrar en Traza"
   useEffect(() => {
     if (!cameraTarget || !mapRef.current) return;
+    const state = useFlightStore.getState();
+
+    // If Camera Lock is active on the selected aircraft, update zoom/pitch without starting a competing flyTo timer
+    if (state.followSelectedAircraft && state.selectedIcao24) {
+      const tracked = state.kinematicMap.get(state.selectedIcao24);
+      if (tracked) {
+        dampedCameraRef.current = {
+          lon: tracked.renderLon,
+          lat: tracked.renderLat,
+          lockedId: state.selectedIcao24,
+        };
+        mapRef.current.jumpTo({
+          center: [tracked.renderLon, tracked.renderLat],
+          zoom: cameraTarget.zoom,
+          pitch: cameraTarget.pitch ?? 35,
+          bearing: cameraTarget.bearing ?? 0,
+        });
+        return;
+      }
+    }
+
     mapRef.current.flyTo({
       center: [cameraTarget.lon, cameraTarget.lat],
       zoom: cameraTarget.zoom,
       pitch: cameraTarget.pitch ?? 18,
       bearing: cameraTarget.bearing ?? 0,
-      duration: 1600,
+      duration: 1400,
       essential: true,
     });
   }, [cameraTarget]);
 
-  // 60 FPS Kinematic Dead Reckoning loop updating Deck.gl WebGL layers directly
-  useDeadReckoning((aircraftList, pulsePhase, frameTimeMs) => {
-    const overlay = deckOverlayRef.current;
-    if (!overlay) return;
+  // 60/120 FPS Kinematic Dead Reckoning loop updating Deck.gl WebGL layers & dampened Camera Lock directly
+  useDeadReckoning(
+    (aircraftList, pulsePhase, frameTimeMs, frameDtSec, buffers) => {
+      const overlay = deckOverlayRef.current;
+      if (!overlay) return;
 
-    const state = useFlightStore.getState();
-    const selectedId = state.selectedIcao24;
-    const firs = state.firs;
-    const showFIRs = state.showFIRBoundaries;
-    const trail = state.selectedTrail;
+      const state = useFlightStore.getState();
+      const selectedId = state.selectedIcao24;
+      const firs = state.firs;
+      const showFIRs = state.showFIRBoundaries;
+      const trail = state.selectedTrail;
 
-    // Follow selected aircraft smoothly if lock-on mode is active
-    if (state.followSelectedAircraft && selectedId && mapRef.current) {
-      const tracked = state.kinematicMap.get(selectedId);
-      if (tracked) {
-        mapRef.current.jumpTo({
-          center: [tracked.renderLon, tracked.renderLat],
-        });
+      // Smooth Camera Lock ("Modo Seguimiento"): synchronize camera per-frame with exponential dampening
+      if (state.followSelectedAircraft && selectedId && mapRef.current) {
+        const tracked = state.kinematicMap.get(selectedId);
+        if (tracked) {
+          const cam = dampedCameraRef.current;
+          if (cam.lockedId !== selectedId) {
+            const currentCenter = mapRef.current.getCenter();
+            const distDeg = Math.hypot(
+              tracked.renderLon - currentCenter.lng,
+              tracked.renderLat - currentCenter.lat
+            );
+            // If locking onto a distant aircraft (> 1.2 deg away), snap once to its render position, then dampen smoothly
+            cam.lon = distDeg > 1.2 ? tracked.renderLon : currentCenter.lng;
+            cam.lat = distDeg > 1.2 ? tracked.renderLat : currentCenter.lat;
+            cam.lockedId = selectedId;
+          }
+
+          // Camera dampening factor alpha_cam = 1 - exp(-10 * dt) for silky zero-jitter tracking
+          const camAlpha = Math.min(1.0, 1.0 - Math.exp(-10.0 * frameDtSec));
+          cam.lon = cam.lon + (tracked.renderLon - cam.lon) * camAlpha;
+          cam.lat = cam.lat + (tracked.renderLat - cam.lat) * camAlpha;
+
+          mapRef.current.jumpTo({
+            center: [cam.lon, cam.lat],
+          });
+        }
+      } else {
+        dampedCameraRef.current.lockedId = null;
       }
-    }
 
-    // Build altitude-graded geodesic trail segments for the selected aircraft
-    const breadcrumbSegments: BreadcrumbSegment[] = [];
-    if (selectedId && trail.length > 0) {
-      const selectedAc = state.kinematicMap.get(selectedId);
-      const fullPoints = [
-        ...trail.map((pt) => ({ lon: pt.lon, lat: pt.lat, alt: pt.alt })),
-        ...(selectedAc
-          ? [{ lon: selectedAc.renderLon, lat: selectedAc.renderLat, alt: selectedAc.renderAlt }]
-          : []),
-      ];
+      const frustum = frustumBoundsRef.current;
 
-      for (let i = 0; i < fullPoints.length - 1; i++) {
-        const p1 = fullPoints[i];
-        const p2 = fullPoints[i + 1];
-        breadcrumbSegments.push({
-          path: [
-            [p1.lon, p1.lat],
-            [p2.lon, p2.lat],
-          ],
-          color: getAltitudeColorRGBA((p1.alt + p2.alt) / 2, null, false),
-        });
+      // Build altitude-graded geodesic trail segments for the selected aircraft (with frustum culling)
+      const breadcrumbSegments: BreadcrumbSegment[] = [];
+      if (selectedId && trail.length > 0) {
+        const selectedAc = state.kinematicMap.get(selectedId);
+        const fullPoints = [
+          ...trail.map((pt) => ({ lon: pt.lon, lat: pt.lat, alt: pt.alt })),
+          ...(selectedAc
+            ? [{ lon: selectedAc.renderLon, lat: selectedAc.renderLat, alt: selectedAc.renderAlt }]
+            : []),
+        ];
+
+        for (let i = 0; i < fullPoints.length - 1; i++) {
+          const p1 = fullPoints[i];
+          const p2 = fullPoints[i + 1];
+
+          // Frustum Culling for trail segments
+          if (
+            frustum &&
+            (p1.lat < frustum.lamin ||
+              p1.lat > frustum.lamax ||
+              p1.lon < frustum.lomin ||
+              p1.lon > frustum.lomax) &&
+            (p2.lat < frustum.lamin ||
+              p2.lat > frustum.lamax ||
+              p2.lon < frustum.lomin ||
+              p2.lon > frustum.lomax)
+          ) {
+            continue;
+          }
+
+          breadcrumbSegments.push({
+            path: [
+              [p1.lon, p1.lat],
+              [p2.lon, p2.lat],
+            ],
+            color: getAltitudeColorRGBA((p1.alt + p2.alt) / 2, null, false),
+          });
+        }
       }
-    }
 
-    // Filter emergency or selected aircraft for tactical radar ring highlights
-    const highlightedAircraft = aircraftList.filter(
-      (ac) => ac.icao24 === selectedId || isEmergencySquawk(ac.squawk)
-    );
+      // Filter emergency or selected aircraft for tactical radar ring highlights
+      const highlightedAircraft = aircraftList.filter(
+        (ac) => ac.icao24 === selectedId || isEmergencySquawk(ac.squawk)
+      );
 
-    const layers = [
-      // 1. Chilean FIR Boundaries Layer (SCEZ, SCFA, SCTE, SCCF, SCIP)
-      new PolygonLayer<FIRDefinition>({
-        id: 'chile-firs-layer',
-        data: showFIRs ? firs : [],
-        pickable: false,
-        stroked: true,
-        filled: true,
-        wireframe: false,
-        lineWidthMinPixels: 1.4,
-        getPolygon: (d) => d.polygon,
-        getFillColor: (d) => hexToRgba(d.color, 18),
-        getLineColor: (d) => hexToRgba(d.color, 130),
-      }),
+      const layers = [
+        // 1. Chilean FIR Boundaries Layer (SCEZ, SCFA, SCTE, SCCF, SCIP)
+        new PolygonLayer<FIRDefinition>({
+          id: 'chile-firs-layer',
+          data: showFIRs ? firs : [],
+          pickable: false,
+          stroked: true,
+          filled: true,
+          wireframe: false,
+          lineWidthMinPixels: 1.4,
+          getPolygon: (d) => d.polygon,
+          getFillColor: (d) => hexToRgba(d.color, 18),
+          getLineColor: (d) => hexToRgba(d.color, 130),
+        }),
 
-      // 2. Historical Geodesic Flight Breadcrumbs with Altitude Profile Gradient
-      new PathLayer<BreadcrumbSegment>({
-        id: 'flight-breadcrumbs-layer',
-        data: breadcrumbSegments,
-        pickable: false,
-        widthScale: 1,
-        widthMinPixels: 3.5,
-        widthMaxPixels: 6,
-        capRounded: true,
-        jointRounded: true,
-        getPath: (d) => d.path,
-        getColor: (d) => d.color,
-        getWidth: 4,
-      }),
+        // 2. Historical Geodesic Flight Breadcrumbs with Altitude Profile Gradient
+        new PathLayer<BreadcrumbSegment>({
+          id: 'flight-breadcrumbs-layer',
+          data: breadcrumbSegments,
+          pickable: false,
+          widthScale: 1,
+          widthMinPixels: 3.5,
+          widthMaxPixels: 6,
+          capRounded: true,
+          jointRounded: true,
+          getPath: (d) => d.path,
+          getColor: (d) => d.color,
+          getWidth: 4,
+        }),
 
-      // 3. Pulsing Tactical Rings for Selected Aircraft & Emergency Squawks (7500/7600/7700)
-      new ScatterplotLayer<KinematicAircraft>({
-        id: 'tactical-halo-layer',
-        data: highlightedAircraft,
-        pickable: false,
-        stroked: true,
-        filled: true,
-        radiusUnits: 'pixels',
-        lineWidthMinPixels: 2,
-        getPosition: (d) => [d.renderLon, d.renderLat],
-        getRadius: (d) =>
-          isEmergencySquawk(d.squawk) ? 14 + pulsePhase * 12 : 16,
-        getFillColor: (d) =>
-          isEmergencySquawk(d.squawk)
-            ? [239, 68, 68, Math.round(45 + pulsePhase * 65)]
-            : [250, 204, 21, 45],
-        getLineColor: (d) =>
-          isEmergencySquawk(d.squawk)
-            ? [255, 50, 50, Math.round(180 + pulsePhase * 75)]
-            : [250, 204, 21, 235],
-        updateTriggers: {
-          getPosition: frameTimeMs,
-          getRadius: frameTimeMs,
-          getFillColor: frameTimeMs,
-          getLineColor: frameTimeMs,
-        },
-      }),
+        // 3. Pulsing Tactical Rings for Selected Aircraft & Emergency Squawks (7500/7600/7700)
+        new ScatterplotLayer<KinematicAircraft>({
+          id: 'tactical-halo-layer',
+          data: highlightedAircraft,
+          pickable: false,
+          stroked: true,
+          filled: true,
+          radiusUnits: 'pixels',
+          lineWidthMinPixels: 2,
+          getPosition: (d) => [d.renderLon, d.renderLat],
+          getRadius: (d) =>
+            isEmergencySquawk(d.squawk) ? 14 + pulsePhase * 12 : 16,
+          getFillColor: (d) =>
+            isEmergencySquawk(d.squawk)
+              ? [239, 68, 68, Math.round(45 + pulsePhase * 65)]
+              : [250, 204, 21, 45],
+          getLineColor: (d) =>
+            isEmergencySquawk(d.squawk)
+              ? [255, 50, 50, Math.round(180 + pulsePhase * 75)]
+              : [250, 204, 21, 235],
+          updateTriggers: {
+            getPosition: frameTimeMs,
+            getRadius: frameTimeMs,
+            getFillColor: frameTimeMs,
+            getLineColor: frameTimeMs,
+          },
+        }),
 
-      // 4. High-Performance WebGL Aircraft IconLayer rotated around exact center pivot
-      new IconLayer<KinematicAircraft>({
+      // 4. High-Volume WebGL Instanced Aircraft IconLayer driven directly by Float32Array & Uint8Array buffers
+      new IconLayer({
         id: 'aircraft-kinematic-icon-layer',
-        data: aircraftList,
+        data: {
+          length: buffers.count,
+          attributes: {
+            getPosition: {
+              value: buffers.positions.subarray(0, buffers.count * 3),
+              size: 3,
+            },
+            getAngle: {
+              value: buffers.angles.subarray(0, buffers.count),
+              size: 1,
+            },
+            getSize: {
+              value: buffers.sizes.subarray(0, buffers.count),
+              size: 1,
+            },
+            getColor: {
+              value: buffers.colors.subarray(0, buffers.count * 4),
+              size: 4,
+            },
+          },
+        },
         pickable: true,
         iconAtlas: AIRCRAFT_ICON_ATLAS,
         iconMapping: AIRCRAFT_ICON_MAPPING,
-        getIcon: () => 'aircraft',
+        getIcon: 'aircraft' as unknown as () => string,
         sizeScale: 1,
         sizeUnits: 'pixels',
-        sizeMinPixels: 20,
+        sizeMinPixels: currentZoomRef.current < 4.0 ? 12 : 18,
         sizeMaxPixels: 38,
         billboard: false,
-        getPosition: (d) => [d.renderLon, d.renderLat],
-        getSize: (d) =>
-          d.icao24 === selectedId
-            ? 32
-            : isEmergencySquawk(d.squawk)
-            ? 30
-            : 24,
-        getAngle: (d) => (360 - d.renderTrack) % 360,
-        getColor: (d) =>
-          getAltitudeColorRGBA(
-            d.renderAlt,
-            d.squawk,
-            d.icao24 === selectedId,
-            pulsePhase
-          ),
-        onHover: (info: PickingInfo<KinematicAircraft>) => {
-          if (info.object) {
+        onHover: (info: PickingInfo) => {
+          const picked =
+            typeof info.index === 'number' && info.index >= 0
+              ? aircraftList[info.index]
+              : undefined;
+          if (picked) {
             setHoveredAircraft({
               x: info.x,
               y: info.y,
-              aircraft: info.object,
+              aircraft: picked,
             });
           } else {
             setHoveredAircraft(null);
           }
         },
-        onClick: (info: PickingInfo<KinematicAircraft>) => {
-          if (info.object) {
-            setSelectedIcao24(info.object.icao24);
+        onClick: (info: PickingInfo) => {
+          const picked =
+            typeof info.index === 'number' && info.index >= 0
+              ? aircraftList[info.index]
+              : undefined;
+          if (picked) {
+            setSelectedIcao24(picked.icao24);
           }
-        },
-        updateTriggers: {
-          getPosition: frameTimeMs,
-          getAngle: frameTimeMs,
-          getColor: [frameTimeMs, selectedId],
-          getSize: [selectedId],
         },
       }),
     ];
 
-    overlay.setProps({ layers });
-  });
+      overlay.setProps({ layers });
+    },
+    () => ({
+      frustum: frustumBoundsRef.current,
+      zoom: currentZoomRef.current,
+    })
+  );
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-slate-950 select-none">

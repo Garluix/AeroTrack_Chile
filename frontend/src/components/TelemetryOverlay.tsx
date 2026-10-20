@@ -128,7 +128,19 @@ export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
           <button
             onClick={() => {
               setActiveFIRFilter('ALL');
-              flyTo({ lat: -15.0, lon: -60.0, zoom: 2.3, pitch: 0 });
+              flyTo({ lat: 38.5, lon: -96.5, zoom: 4.1, pitch: 0 });
+            }}
+            className="px-2.5 py-1 rounded-xl bg-slate-900/70 hover:bg-slate-800 border border-slate-800 text-slate-300 font-mono text-[11px] flex items-center gap-1 transition-colors"
+            title="Vista Continental EE.UU. (Alta Densidad FAA/ADS-B)"
+          >
+            <Plane className="w-3.5 h-3.5 text-amber-400" />
+            <span>EE.UU.</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setActiveFIRFilter('ALL');
+              flyTo({ lat: 15.0, lon: -30.0, zoom: 2.1, pitch: 0 });
             }}
             className="px-2.5 py-1 rounded-xl bg-slate-900/70 hover:bg-slate-800 border border-slate-800 text-slate-300 font-mono text-[11px] flex items-center gap-1 transition-colors"
             title="Vista Global Slippy Map"
