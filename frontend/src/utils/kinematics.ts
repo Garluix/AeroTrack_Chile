@@ -429,6 +429,53 @@ export function msToMach(velocityMs: number, altitudeMeters: number): number {
   return Number((velocityMs / speedOfSound).toFixed(2));
 }
 
+export const HELICOPTER_ICAO_CODES = new Set<string>([
+  'B06', 'B06T', 'B206', 'B212', 'B222', 'B230', 'B407', 'B412', 'B427', 'B429', 'B430', 'B505', 'B525',
+  'AS32', 'AS3B', 'AS50', 'AS55', 'AS65', 'EC20', 'EC25', 'EC30', 'EC35', 'EC45', 'EC55', 'EC75',
+  'H125', 'H130', 'H135', 'H145', 'H155', 'H160', 'H175', 'H215', 'H225',
+  'S58T', 'S61', 'S61R', 'S64', 'S70', 'S76', 'S92', 'H60', 'UH60', 'SH60', 'HH60', 'MH60',
+  'CH47', 'H47', 'CH53', 'H53', 'AH64', 'H64', 'AH1', 'UH1', 'BELL', 'HELI',
+  'R22', 'R44', 'R66',
+  'A109', 'A119', 'A139', 'AW139', 'A149', 'A169', 'A189', 'AW09', 'AW109', 'AW119', 'AW169', 'AW189', 'EH10', 'AW101',
+  'MD52', 'MD60', 'EXPL', 'H500', 'MD500', 'NOTR', 'EXEC', 'EN28', 'EN48', 'G2CA', 'CABR', 'S300', 'H269',
+  'KMAX', 'KA27', 'KA32', 'MI8', 'MI17', 'MI24', 'MI26', 'MI28', 'MI38', 'ALH', 'BK17', 'BO10', 'BO105',
+  'GAZL', 'SA30', 'SA31', 'SA32', 'SA33', 'SA34', 'SA36', 'PUMA', 'LAMA', 'ALOU', 'V22',
+]);
+
+/**
+ * Validates whether an aircraft code or model description matches a rotorcraft/helicopter.
+ */
+export function isHelicopterAirframe(code?: string, desc?: string): boolean {
+  const cleanCode = (code || '').trim().toUpperCase();
+  if (cleanCode && HELICOPTER_ICAO_CODES.has(cleanCode)) {
+    return true;
+  }
+  if (desc) {
+    const upperDesc = desc.toUpperCase();
+    if (
+      upperDesc.includes('HELICOPTER') ||
+      upperDesc.includes('ROTORCRAFT') ||
+      upperDesc.includes('GYROCOPTER') ||
+      upperDesc.includes('BELL 206') ||
+      upperDesc.includes('BELL 407') ||
+      upperDesc.includes('BELL 412') ||
+      upperDesc.includes('BELL 429') ||
+      upperDesc.includes('BELL 505') ||
+      upperDesc.includes('EUROCOPTER') ||
+      upperDesc.includes('ECUREUIL') ||
+      upperDesc.includes('BLACK HAWK') ||
+      upperDesc.includes('SIKORSKY') ||
+      upperDesc.includes('ROBINSON R') ||
+      upperDesc.includes('AGUSTA') ||
+      upperDesc.includes('AW139') ||
+      upperDesc.includes('LEONARDO')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Generates a high-DPI 256x128 dual-icon atlas PNG data URL containing:
  * - Slot 0 [x: 0..128, pivot (64,64)]: Fixed-wing commercial jet ('aircraft') pointing North (0 deg).

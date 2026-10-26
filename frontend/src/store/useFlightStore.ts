@@ -10,7 +10,10 @@ import {
   SystemMetrics,
   TrailBreadcrumb,
 } from '../types/telemetry';
-import { computeMonotonicAnchorTimestamp } from '../utils/kinematics';
+import {
+  computeMonotonicAnchorTimestamp,
+  isHelicopterAirframe,
+} from '../utils/kinematics';
 
 export interface CameraTarget {
   lat: number;
@@ -107,7 +110,7 @@ function upsertKinematicEntity(
     existing.fir = frame.fir;
     existing.source = frame.source;
     existing.server_timestamp = frame.server_timestamp;
-    existing.isHelicopter = Boolean(frame.isHelicopter);
+    existing.isHelicopter = Boolean(frame.isHelicopter) || isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model);
     if (frame.registration) existing.registration = frame.registration;
     if (frame.aircraft_code) existing.aircraft_code = frame.aircraft_code;
     if (frame.aircraft_model) existing.aircraft_model = frame.aircraft_model;
@@ -134,7 +137,7 @@ function upsertKinematicEntity(
   } else {
     map.set(frame.icao24, {
       ...frame,
-      isHelicopter: Boolean(frame.isHelicopter),
+      isHelicopter: Boolean(frame.isHelicopter) || isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model),
       rawLat: frame.lat,
       rawLon: frame.lon,
       anchorLat: frame.lat,
@@ -230,7 +233,7 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
             registration: t[15] || undefined,
             aircraft_code: t[16] || undefined,
             aircraft_model: t[17] || undefined,
-            isHelicopter: Boolean(t[18]),
+            isHelicopter: Boolean(t[18]) || isHelicopterAirframe(t[16], t[17]),
           },
           nowMs
         );

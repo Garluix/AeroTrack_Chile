@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useFlightStore } from '../store/useFlightStore';
-import { BoundingBox, FIRDefinition, ServerWSMessage } from '../types/telemetry';
+import { AircraftTelemetry, BoundingBox, FIRDefinition, ServerWSMessage } from '../types/telemetry';
 
 function resolveApiBase(): string {
   if (import.meta.env.VITE_API_URL) {
@@ -38,7 +38,7 @@ export function useFlightStream() {
   const updateSystemMetrics = useFlightStore((s) => s.updateSystemMetrics);
   const selectedIcao24 = useFlightStore((s) => s.selectedIcao24);
 
-  // Load Chilean FIR polygon definitions on mount
+  // Load Chilean FIR polygon definitions & initial aircraft snapshot on mount
   useEffect(() => {
     fetch(`${API_BASE}/firs`)
       .then((res) => res.json())
@@ -50,7 +50,29 @@ export function useFlightStream() {
       .catch(() => {
         // Fallback FIRs if API is still warming up
       });
-  }, [setFirs]);
+
+    fetch(`${API_BASE}/flights`)
+      .then((res) => res.json())
+      .then((data: { aircraft?: AircraftTelemetry[]; source?: string }) => {
+        if (Array.isArray(data.aircraft) && data.aircraft.length > 0) {
+          const state = useFlightStore.getState();
+          if (state.kinematicMap.size === 0) {
+            ingestTelemetryBatch(
+              undefined,
+              data.aircraft,
+              [],
+              state.metrics.activeBbox,
+              state.metrics.activeGeohashes,
+              (data.source as 'adsbfi' | 'opensky' | 'hybrid' | 'synthetic') || 'adsbfi',
+              data.aircraft.length
+            );
+          }
+        }
+      })
+      .catch(() => {
+        // WebSocket stream will populate telemetry
+      });
+  }, [setFirs, ingestTelemetryBatch]);
 
   const connectWebSocket = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= 1) return;
