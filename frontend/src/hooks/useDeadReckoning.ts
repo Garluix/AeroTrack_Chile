@@ -68,9 +68,9 @@ export function useDeadReckoning(
 
       const state = useFlightStore.getState();
       const map = state.kinematicMap;
-      const activeFilter = state.activeFIRFilter;
-      const filterType = state.filterType;
-      const searchQuery = state.searchQuery.trim().toLowerCase();
+      const activeFilter = state.activeFIRFilter || 'ALL';
+      const filterType = state.filterType || 'all';
+      const searchQuery = (state.searchQuery || '').trim().toLowerCase();
       const selectedId = state.selectedIcao24;
 
       const vpState = getViewportStateRef.current
@@ -98,11 +98,13 @@ export function useDeadReckoning(
       let gpuIdx = 0;
 
       for (const ac of map.values()) {
+        const isHeli = Boolean(ac.isHelicopter);
         // 1. In-memory category filtering BEFORE GPU buffer injection (zero React re-renders)
-        if (filterType === 'planes' && ac.isHelicopter === true) {
+        // Safe fallback: when filterType === 'all' or undefined, render the entire aircraft catalog
+        if (filterType === 'planes' && isHeli) {
           continue;
         }
-        if (filterType === 'helicopters' && ac.isHelicopter !== true) {
+        if (filterType === 'helicopters' && !isHeli) {
           continue;
         }
 
@@ -112,11 +114,12 @@ export function useDeadReckoning(
         // 2. Dynamic Viewport Frustum Culling:
         // When zoomed into a specific region (or continent), omit entities outside the visible camera frustum
         // BEFORE running heavy per-frame trigonometry or uploading to the GPU.
+        // We bypass frustum culling when the user specifically selects helicopters or global view,
+        // so the rotorcraft swarm (~400 entities globally) is always visible and actionable.
+        const bypassFrustum = isGlobalView || isSelected || isEmergency || filterType === 'helicopters';
         if (
           frustum &&
-          !isGlobalView &&
-          !isSelected &&
-          !isEmergency &&
+          !bypassFrustum &&
           (ac.renderLat < frustum.lamin ||
             ac.renderLat > frustum.lamax ||
             ac.renderLon < frustum.lomin ||
@@ -187,14 +190,18 @@ export function useDeadReckoning(
         }
       }
 
-      onFrameRef.current(renderedList, pulsePhase, nowMs, frameDtSec, {
-        positions,
-        angles,
-        sizes,
-        colors,
-        iconDefs,
-        count: gpuIdx,
-      });
+      try {
+        onFrameRef.current(renderedList, pulsePhase, nowMs, frameDtSec, {
+          positions,
+          angles,
+          sizes,
+          colors,
+          iconDefs,
+          count: gpuIdx,
+        });
+      } catch (err) {
+        console.error('[useDeadReckoning] Frame render error:', err);
+      }
 
       // Periodically sync HUD telemetry readout (~4Hz) and FPS counter (~1Hz)
       if (nowMs - lastSelectedSyncTime > 250) {

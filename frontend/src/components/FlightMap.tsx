@@ -493,8 +493,11 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
           pickable: true,
           iconAtlas: AIRCRAFT_ICON_ATLAS,
           iconMapping: AIRCRAFT_ICON_MAPPING,
-          getIcon: ((d: KinematicAircraft) =>
-            d?.isHelicopter ? 'helicopter' : 'aircraft') as unknown as () => string,
+          getIcon: ((d: KinematicAircraft | undefined, { index }: { index: number }) =>
+            (d?.isHelicopter ?? aircraftList[index]?.isHelicopter) ? 'helicopter' : 'aircraft') as unknown as () => string,
+          updateTriggers: {
+            getIcon: [frameTimeMs, buffers.count, state.filterType],
+          },
           sizeScale: 1,
           sizeUnits: 'pixels',
           sizeMinPixels: currentZoomRef.current < 4.0 ? 12 : 18,
