@@ -24,8 +24,6 @@ interface BreadcrumbSegment {
   color: [number, number, number, number];
 }
 
-type BasemapMode = 'osm-dark' | 'osm-clear' | 'maplibre-vector';
-
 const INITIAL_LAT = Number(import.meta.env.VITE_INITIAL_LAT ?? -33.4489);
 const INITIAL_LON = Number(import.meta.env.VITE_INITIAL_LON ?? -70.6693);
 const INITIAL_ZOOM = Number(import.meta.env.VITE_INITIAL_ZOOM ?? 6.0);
@@ -131,7 +129,6 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
     lockedId: null,
   });
 
-  const [basemapMode, setBasemapMode] = useState<BasemapMode>('osm-dark');
   const [hoveredAircraft, setHoveredAircraft] = useState<{
     x: number;
     y: number;
@@ -267,19 +264,6 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
       deckOverlayRef.current = null;
     };
   }, [onViewportChanged]);
-
-  // Switch between OpenStreetMap Dark Radar, OpenStreetMap Standard, and MapLibre Demo Vector Style
-  const handleSelectBasemap = (mode: BasemapMode) => {
-    setBasemapMode(mode);
-    if (!mapRef.current) return;
-    if (mode === 'maplibre-vector') {
-      mapRef.current.setStyle('https://demotiles.maplibre.org/style.json');
-    } else if (mode === 'osm-clear') {
-      mapRef.current.setStyle(buildOpenStreetMapStyle(false));
-    } else {
-      mapRef.current.setStyle(buildOpenStreetMapStyle(true));
-    }
-  };
 
   // Smooth camera transitions when user selects a FIR sector, Global preset, or "Centrar en Traza"
   useEffect(() => {
@@ -544,40 +528,6 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
         ref={mapContainerRef}
         className="w-full h-full cursor-crosshair"
       />
-
-      {/* Basemap Selector (OpenStreetMap Raster / MapLibre Vector Demo - Zero CartoDB URLs) */}
-      <div className="fixed bottom-3 right-14 z-20 flex items-center gap-1 p-1 rounded-xl bg-slate-950/85 backdrop-blur-md border border-slate-800 text-[11px] font-mono shadow-lg">
-        <button
-          onClick={() => handleSelectBasemap('osm-dark')}
-          className={`px-2.5 py-1 rounded-lg transition-colors ${
-            basemapMode === 'osm-dark'
-              ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/40 font-semibold'
-              : 'text-slate-400 hover:text-slate-200'
-          }`}
-        >
-          OSM Radar
-        </button>
-        <button
-          onClick={() => handleSelectBasemap('osm-clear')}
-          className={`px-2.5 py-1 rounded-lg transition-colors ${
-            basemapMode === 'osm-clear'
-              ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/40 font-semibold'
-              : 'text-slate-400 hover:text-slate-200'
-          }`}
-        >
-          OSM Claro
-        </button>
-        <button
-          onClick={() => handleSelectBasemap('maplibre-vector')}
-          className={`px-2.5 py-1 rounded-lg transition-colors ${
-            basemapMode === 'maplibre-vector'
-              ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/40 font-semibold'
-              : 'text-slate-400 hover:text-slate-200'
-          }`}
-        >
-          MapLibre Vector
-        </button>
-      </div>
 
       {/* Instant hover tactical micro-tag */}
       {hoveredAircraft && (
