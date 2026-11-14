@@ -100,6 +100,11 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const deckOverlayRef = useRef<MapboxOverlay | null>(null);
   const viewportDebounceRef = useRef<number | null>(null);
+  const firsLayerCacheRef = useRef<{
+    firs: FIRDefinition[];
+    showFIRs: boolean;
+    layer: PolygonLayer<FIRDefinition>;
+  } | null>(null);
 
   // Mutable geospatial frustum bounds & zoom for GPU Frustum Culling (updated without React re-renders)
   const frustumBoundsRef = useRef<BoundingBox | null>(null);
@@ -383,25 +388,33 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
         }
       }
 
-      // Filter emergency or selected aircraft for tactical radar ring highlights
-      const highlightedAircraft = aircraftList.filter(
-        (ac) => ac.icao24 === selectedId || isEmergencySquawk(ac.squawk)
-      );
+      // Memoize static Chilean FIR PolygonLayer so it is not re-instantiated at 60/120 Hz
+      if (
+        !firsLayerCacheRef.current ||
+        firsLayerCacheRef.current.firs !== firs ||
+        firsLayerCacheRef.current.showFIRs !== showFIRs
+      ) {
+        firsLayerCacheRef.current = {
+          firs,
+          showFIRs,
+          layer: new PolygonLayer<FIRDefinition>({
+            id: 'chile-firs-layer',
+            data: showFIRs ? firs : [],
+            pickable: false,
+            stroked: true,
+            filled: true,
+            wireframe: false,
+            lineWidthMinPixels: 1.4,
+            getPolygon: (d) => d.polygon,
+            getFillColor: (d) => hexToRgba(d.color, 18),
+            getLineColor: (d) => hexToRgba(d.color, 130),
+          }),
+        };
+      }
 
       const layers = [
-        // 1. Chilean FIR Boundaries Layer (SCEZ, SCFA, SCTE, SCCF, SCIP)
-        new PolygonLayer<FIRDefinition>({
-          id: 'chile-firs-layer',
-          data: showFIRs ? firs : [],
-          pickable: false,
-          stroked: true,
-          filled: true,
-          wireframe: false,
-          lineWidthMinPixels: 1.4,
-          getPolygon: (d) => d.polygon,
-          getFillColor: (d) => hexToRgba(d.color, 18),
-          getLineColor: (d) => hexToRgba(d.color, 130),
-        }),
+        // 1. Memoized Chilean FIR Boundaries Layer (SCEZ, SCFA, SCTE, SCCF, SCIP)
+        firsLayerCacheRef.current.layer,
 
         // 2. Historical Geodesic Flight Breadcrumbs with Altitude Profile Gradient
         new PathLayer<BreadcrumbSegment>({
@@ -421,7 +434,7 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
         // 3. Pulsing Tactical Rings for Selected Aircraft & Emergency Squawks (7500/7600/7700)
         new ScatterplotLayer<KinematicAircraft>({
           id: 'tactical-halo-layer',
-          data: highlightedAircraft,
+          data: buffers.highlighted,
           pickable: false,
           stroked: true,
           filled: true,
@@ -453,23 +466,23 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
             length: buffers.count,
             attributes: {
               getPosition: {
-                value: buffers.positions.subarray(0, buffers.count * 3),
+                value: buffers.positions,
                 size: 3,
               },
               getAngle: {
-                value: buffers.angles.subarray(0, buffers.count),
+                value: buffers.angles,
                 size: 1,
               },
               getSize: {
-                value: buffers.sizes.subarray(0, buffers.count),
+                value: buffers.sizes,
                 size: 1,
               },
               getColor: {
-                value: buffers.colors.subarray(0, buffers.count * 4),
+                value: buffers.colors,
                 size: 4,
               },
               instanceIconDefs: {
-                value: buffers.iconDefs.subarray(0, buffers.count * 7),
+                value: buffers.iconDefs,
                 size: 7,
               },
             },
@@ -480,7 +493,7 @@ export const FlightMap: React.FC<FlightMapProps> = ({ onViewportChanged }) => {
           getIcon: ((d: KinematicAircraft | undefined, { index }: { index: number }) =>
             (d?.isHelicopter ?? aircraftList[index]?.isHelicopter) ? 'helicopter' : 'aircraft') as unknown as () => string,
           updateTriggers: {
-            getIcon: [frameTimeMs, buffers.count, state.filterType],
+            getIcon: [buffers.count, state.filterType, state.batchVersion],
           },
           sizeScale: 1,
           sizeUnits: 'pixels',

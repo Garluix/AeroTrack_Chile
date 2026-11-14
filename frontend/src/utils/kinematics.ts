@@ -3,6 +3,47 @@ import { KinematicAircraft } from '../types/telemetry';
 const EARTH_RADIUS_M = 6371000.0;
 const DEG_TO_RAD = Math.PI / 180.0;
 const RAD_TO_DEG = 180.0 / Math.PI;
+const DEG_PER_METER_LAT = RAD_TO_DEG / EARTH_RADIUS_M;
+
+// Module-scoped scratch registers for zero-allocation Great Circle & Slerp math
+let scratchTargetLat = 0.0;
+let scratchTargetLon = 0.0;
+let scratchAntLat = 0.0;
+let scratchAntLon = 0.0;
+
+export interface FrameKinematicConstants {
+  groundAlpha: number;
+  trackAlpha: number;
+  posAlpha: number;
+}
+
+/**
+ * Precomputes exponential smoothing factors once per animation frame
+ * instead of invoking Math.exp() per entity.
+ */
+export function computeFrameKinematicConstants(frameDtSec: number): FrameKinematicConstants {
+  return {
+    groundAlpha: Math.min(1.0, 1.0 - Math.exp(-6.0 * frameDtSec)),
+    trackAlpha: Math.min(1.0, 1.0 - Math.exp(-5.5 * frameDtSec)),
+    posAlpha: Math.min(1.0, 1.0 - Math.exp(-4.2 * frameDtSec)),
+  };
+}
+
+/**
+ * Precomputes cosine-corrected geodesic velocity components (deg/sec) on the entity
+ * when a telemetry fix arrives, eliminating per-frame trigonometry in the 60/120 FPS loop.
+ */
+export function updatePrecomputedVelocity(ac: KinematicAircraft): void {
+  if (ac.on_ground || ac.velocity <= 0.1) {
+    ac.degLatPerSec = 0.0;
+    ac.degLonPerSec = 0.0;
+    return;
+  }
+  const thetaRad = ac.true_track * DEG_TO_RAD;
+  const cosLat = Math.max(0.15, Math.cos(ac.anchorLat * DEG_TO_RAD));
+  ac.degLatPerSec = ac.velocity * Math.cos(thetaRad) * DEG_PER_METER_LAT;
+  ac.degLonPerSec = (ac.velocity * Math.sin(thetaRad) * DEG_PER_METER_LAT) / cosLat;
+}
 
 /**
  * Projects estimated position P_t on the Earth's sphere given:
@@ -162,52 +203,109 @@ export function computeMonotonicAnchorTimestamp(
   return nowMs;
 }
 
+function projectGreatCircleToScratch(
+  lat0: number,
+  lon0: number,
+  velocityMs: number,
+  trueTrackDeg: number,
+  dtSec: number,
+  isTarget: boolean
+): void {
+  if (velocityMs <= 0.1 || dtSec <= 0) {
+    if (isTarget) {
+      scratchTargetLat = lat0;
+      scratchTargetLon = lon0;
+    } else {
+      scratchAntLat = lat0;
+      scratchAntLon = lon0;
+    }
+    return;
+  }
+
+  const clampedDt = dtSec > 25.0 ? 25.0 : dtSec;
+  const angularDistance = (velocityMs * clampedDt) / EARTH_RADIUS_M;
+
+  const phi0 = lat0 * DEG_TO_RAD;
+  const lambda0 = lon0 * DEG_TO_RAD;
+  const theta = trueTrackDeg * DEG_TO_RAD;
+
+  const sinPhi0 = Math.sin(phi0);
+  const cosPhi0 = Math.cos(phi0);
+  const sinDelta = Math.sin(angularDistance);
+  const cosDelta = Math.cos(angularDistance);
+
+  const sinPhiT = sinPhi0 * cosDelta + cosPhi0 * sinDelta * Math.cos(theta);
+  const phiT = Math.asin(sinPhiT < -1.0 ? -1.0 : sinPhiT > 1.0 ? 1.0 : sinPhiT);
+
+  const y = Math.sin(theta) * sinDelta * cosPhi0;
+  const x = cosDelta - sinPhi0 * sinPhiT;
+  const lambdaT = lambda0 + Math.atan2(y, x);
+
+  const latT = phiT * RAD_TO_DEG;
+  const lonT = (((lambdaT * RAD_TO_DEG) + 540.0) % 360.0) - 180.0;
+
+  if (isTarget) {
+    scratchTargetLat = latT;
+    scratchTargetLon = lonT;
+  } else {
+    scratchAntLat = latT;
+    scratchAntLon = lonT;
+  }
+}
+
 /**
  * Advances a single KinematicAircraft in-place for the current animation frame (60/120 FPS):
  * Implements continuous Spherical/Linear Lerp with Dead Reckoning:
  *   P(t) = P_anterior + (P_objetivo(t) - P_anterior) * alpha
- * where alpha is computed as a function of frameDtSec (Delta t).
+ * Zero heap allocations per frame.
  */
 export function stepAircraftKinematics(
   ac: KinematicAircraft,
   nowMs: number,
   frameDtSec: number,
-  highDetail = true
+  highDetail = true,
+  frameConstants?: FrameKinematicConstants
 ): void {
   ac.prevLat = ac.renderLat;
   ac.prevLon = ac.renderLon;
 
+  const groundAlpha = frameConstants
+    ? frameConstants.groundAlpha
+    : Math.min(1.0, 1.0 - Math.exp(-6.0 * frameDtSec));
+
   if (ac.on_ground || ac.velocity < 1.0) {
-    const alpha = Math.min(1.0, 1.0 - Math.exp(-6.0 * frameDtSec));
-    ac.renderLat = ac.prevLat + (ac.anchorLat - ac.prevLat) * alpha;
-    ac.renderLon = ac.prevLon + (ac.anchorLon - ac.prevLon) * alpha;
-    ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, alpha);
+    ac.renderLat = ac.prevLat + (ac.anchorLat - ac.prevLat) * groundAlpha;
+    ac.renderLon = ac.prevLon + (ac.anchorLon - ac.prevLon) * groundAlpha;
+    ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, groundAlpha);
     return;
   }
 
   // 1. Smoothly interpolate heading first so velocity integration follows the curved flight path
-  const trackAlpha = Math.min(1.0, 1.0 - Math.exp(-5.5 * frameDtSec));
+  const trackAlpha = frameConstants
+    ? frameConstants.trackAlpha
+    : Math.min(1.0, 1.0 - Math.exp(-5.5 * frameDtSec));
   ac.renderTrack = lerpAngleDeg(ac.renderTrack, ac.true_track, trackAlpha);
 
   // 2. Time elapsed since the authoritative anchor state was captured
-  const elapsedSinceAnchorSec = Math.min(25.0, Math.max(0, (nowMs - ac.anchorTimestampMs) / 1000.0));
-  const alpha = Math.min(1.0, 1.0 - Math.exp(-4.2 * frameDtSec));
+  const rawElapsed = (nowMs - ac.anchorTimestampMs) * 0.001;
+  const elapsedSinceAnchorSec = rawElapsed < 0 ? 0 : rawElapsed > 25.0 ? 25.0 : rawElapsed;
+  const alpha = frameConstants
+    ? frameConstants.posAlpha
+    : Math.min(1.0, 1.0 - Math.exp(-4.2 * frameDtSec));
 
   if (!highDetail) {
-    // Fast cosine-corrected geodesic Dead Reckoning + Linear Lerp for continental/world view (12,000+ entities)
-    const thetaRad = ac.true_track * DEG_TO_RAD;
-    const cosLat = Math.max(0.15, Math.cos(ac.anchorLat * DEG_TO_RAD));
-    const degPerMeterLat = RAD_TO_DEG / EARTH_RADIUS_M;
-    const degPerMeterLon = degPerMeterLat / cosLat;
+    // Fast cosine-corrected geodesic Dead Reckoning using precomputed deg/sec vectors (Zero trig & zero GC per frame)
+    if (ac.degLatPerSec === undefined || ac.degLonPerSec === undefined) {
+      updatePrecomputedVelocity(ac);
+    }
+    const dLatSec = ac.degLatPerSec!;
+    const dLonSec = ac.degLonPerSec!;
 
-    const vNorth = ac.velocity * Math.cos(thetaRad);
-    const vEast = ac.velocity * Math.sin(thetaRad);
+    const targetLat = ac.anchorLat + dLatSec * elapsedSinceAnchorSec;
+    const targetLon = ac.anchorLon + dLonSec * elapsedSinceAnchorSec;
 
-    const targetLat = ac.anchorLat + vNorth * elapsedSinceAnchorSec * degPerMeterLat;
-    const targetLon = ac.anchorLon + vEast * elapsedSinceAnchorSec * degPerMeterLon;
-
-    const anteriorLat = ac.prevLat + vNorth * frameDtSec * degPerMeterLat;
-    const anteriorLon = ac.prevLon + vEast * frameDtSec * degPerMeterLon;
+    const anteriorLat = ac.prevLat + dLatSec * frameDtSec;
+    const anteriorLon = ac.prevLon + dLonSec * frameDtSec;
 
     ac.renderLat = anteriorLat + (targetLat - anteriorLat) * alpha;
     ac.renderLon = anteriorLon + (targetLon - anteriorLon) * alpha;
@@ -216,33 +314,57 @@ export function stepAircraftKinematics(
     return;
   }
 
-  // 3. High-detail 3D Great Circle Slerp for regional/tactical zoom & locked aircraft
-  const [targetLat, targetLon] = projectGreatCirclePosition(
+  // 3. High-detail 3D Great Circle Slerp for regional/tactical zoom & locked aircraft (Zero tuple allocations)
+  projectGreatCircleToScratch(
     ac.anchorLat,
     ac.anchorLon,
     ac.velocity,
     ac.true_track,
-    elapsedSinceAnchorSec
+    elapsedSinceAnchorSec,
+    true
   );
 
-  const [anteriorLat, anteriorLon] = projectGreatCirclePosition(
+  projectGreatCircleToScratch(
     ac.prevLat,
     ac.prevLon,
     ac.velocity,
     ac.renderTrack,
-    frameDtSec
+    frameDtSec,
+    false
   );
 
-  const [smoothedLat, smoothedLon] = slerpGeoPosition(
-    anteriorLat,
-    anteriorLon,
-    targetLat,
-    targetLon,
-    alpha
-  );
+  const phi1 = scratchAntLat * DEG_TO_RAD;
+  const lam1 = scratchAntLon * DEG_TO_RAD;
+  const phi2 = scratchTargetLat * DEG_TO_RAD;
+  const lam2 = scratchTargetLon * DEG_TO_RAD;
 
-  ac.renderLat = smoothedLat;
-  ac.renderLon = smoothedLon;
+  const cosPhi1 = Math.cos(phi1);
+  const x1 = cosPhi1 * Math.cos(lam1);
+  const y1 = cosPhi1 * Math.sin(lam1);
+  const z1 = Math.sin(phi1);
+
+  const cosPhi2 = Math.cos(phi2);
+  const x2 = cosPhi2 * Math.cos(lam2);
+  const y2 = cosPhi2 * Math.sin(lam2);
+  const z2 = Math.sin(phi2);
+
+  const rawDot = x1 * x2 + y1 * y2 + z1 * z2;
+  const dot = rawDot < -1.0 ? -1.0 : rawDot > 1.0 ? 1.0 : rawDot;
+  const omega = Math.acos(dot);
+
+  if (omega < 1e-6) {
+    ac.renderLat = scratchAntLat + (scratchTargetLat - scratchAntLat) * alpha;
+    ac.renderLon = scratchAntLon + (scratchTargetLon - scratchAntLon) * alpha;
+  } else {
+    const sinOmega = Math.sin(omega);
+    const w1 = Math.sin((1.0 - alpha) * omega) / sinOmega;
+    const w2 = Math.sin(alpha * omega) / sinOmega;
+    const x = w1 * x1 + w2 * x2;
+    const y = w1 * y1 + w2 * y2;
+    const z = w1 * z1 + w2 * z2;
+    ac.renderLat = Math.atan2(z, Math.sqrt(x * x + y * y)) * RAD_TO_DEG;
+    ac.renderLon = Math.atan2(y, x) * RAD_TO_DEG;
+  }
 
   const targetAlt = Math.max(0, ac.anchorAlt + ac.vertical_rate * elapsedSinceAnchorSec);
   ac.renderAlt = ac.renderAlt + (targetAlt - ac.renderAlt) * alpha;

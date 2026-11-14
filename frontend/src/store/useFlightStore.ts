@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import {
+  AircraftCategoryCounts,
   AircraftFilterType,
   AircraftTelemetry,
   BoundingBox,
@@ -12,7 +13,9 @@ import {
 } from '../types/telemetry';
 import {
   computeMonotonicAnchorTimestamp,
+  isEmergencySquawk,
   isHelicopterAirframe,
+  updatePrecomputedVelocity,
 } from '../utils/kinematics';
 
 export interface CameraTarget {
@@ -29,6 +32,9 @@ interface FlightStoreState {
   kinematicMap: Map<string, KinematicAircraft>;
   // Lightweight version counter bumped only on discrete WebSocket batch arrivals
   batchVersion: number;
+  // Precomputed category counts & emergency list updated once per batch in a single pass
+  categoryCounts: AircraftCategoryCounts;
+  emergencyList: KinematicAircraft[];
 
   // Selected aircraft and its historical geodesic breadcrumbs
   selectedIcao24: string | null;
@@ -83,6 +89,142 @@ const DEFAULT_CHILE_BBOX: BoundingBox = {
   lomax: -66.0,
 };
 
+function buildSearchKey(
+  callsign: string,
+  icao24: string,
+  squawk: string | null,
+  originCountry: string
+): string {
+  return `${callsign} ${icao24} ${squawk ?? ''} ${originCountry}`.toLowerCase();
+}
+
+/**
+ * Zero-allocation tuple upsert: mutates existing KinematicAircraft entries in-place
+ * directly from the flat WebSocket wire tuple without creating temporary intermediate objects.
+ */
+function upsertCompactTuple(
+  map: Map<string, KinematicAircraft>,
+  t: CompactAircraftTuple,
+  normalizedSource: 'opensky' | 'adsbfi' | 'synthetic',
+  serverNow: number,
+  nowMs: number
+): void {
+  const icao24 = t[0];
+  const callsign = t[1];
+  const originCountry = t[2];
+  const lat = t[3];
+  const lon = t[4];
+  const baroAlt = t[5];
+  const geoAlt = t[6];
+  const velocity = t[7];
+  const trueTrack = t[8];
+  const verticalRate = t[9];
+  const squawk = t[10];
+  const onGround = t[11] === 1;
+  const lastContact = t[12];
+  const geohash = t[13];
+  const fir = t[14];
+  const registration = t[15] || undefined;
+  const aircraftCode = t[16] || undefined;
+  const aircraftModel = t[17] || undefined;
+  const isHeli = Boolean(t[18]) || isHelicopterAirframe(aircraftCode, aircraftModel);
+
+  const existing = map.get(icao24);
+  if (existing) {
+    const posChanged =
+      Math.abs(lat - existing.rawLat) > 1e-5 ||
+      Math.abs(lon - existing.rawLon) > 1e-5;
+    const searchChanged =
+      existing.callsign !== callsign ||
+      existing.squawk !== squawk ||
+      existing.origin_country !== originCountry;
+
+    existing.callsign = callsign;
+    existing.origin_country = originCountry;
+    existing.lat = lat;
+    existing.lon = lon;
+    existing.baro_altitude = baroAlt;
+    existing.geo_altitude = geoAlt;
+    existing.velocity = velocity;
+    existing.true_track = trueTrack;
+    existing.vertical_rate = verticalRate;
+    existing.squawk = squawk;
+    existing.on_ground = onGround;
+    existing.last_contact = lastContact;
+    existing.geohash = geohash;
+    existing.fir = fir;
+    existing.source = normalizedSource;
+    existing.server_timestamp = serverNow;
+    existing.isHelicopter = isHeli;
+    if (registration) existing.registration = registration;
+    if (aircraftCode) existing.aircraft_code = aircraftCode;
+    if (aircraftModel) existing.aircraft_model = aircraftModel;
+
+    if (searchChanged || !existing.searchKey) {
+      existing.searchKey = buildSearchKey(callsign, icao24, squawk, originCountry);
+    }
+
+    if (posChanged) {
+      existing.rawLat = lat;
+      existing.rawLon = lon;
+      existing.anchorLat = lat;
+      existing.anchorLon = lon;
+      existing.anchorAlt = baroAlt;
+      existing.anchorTrack = trueTrack;
+      existing.anchorTimestampMs = computeMonotonicAnchorTimestamp(
+        existing.renderLat,
+        existing.renderLon,
+        lat,
+        lon,
+        velocity,
+        trueTrack,
+        nowMs
+      );
+    }
+    updatePrecomputedVelocity(existing);
+  } else {
+    const created: KinematicAircraft = {
+      icao24,
+      callsign,
+      origin_country: originCountry,
+      lat,
+      lon,
+      baro_altitude: baroAlt,
+      geo_altitude: geoAlt,
+      velocity,
+      true_track: trueTrack,
+      vertical_rate: verticalRate,
+      squawk,
+      on_ground: onGround,
+      last_contact: lastContact,
+      geohash,
+      fir,
+      source: normalizedSource,
+      server_timestamp: serverNow,
+      registration,
+      aircraft_code: aircraftCode,
+      aircraft_model: aircraftModel,
+      isHelicopter: isHeli,
+      rawLat: lat,
+      rawLon: lon,
+      anchorLat: lat,
+      anchorLon: lon,
+      anchorAlt: baroAlt,
+      anchorTrack: trueTrack,
+      anchorTimestampMs: nowMs,
+      prevLat: lat,
+      prevLon: lon,
+      renderLat: lat,
+      renderLon: lon,
+      renderAlt: baroAlt,
+      renderTrack: trueTrack,
+      searchKey: buildSearchKey(callsign, icao24, squawk, originCountry),
+    };
+    updatePrecomputedVelocity(created);
+    map.set(icao24, created);
+  }
+}
+
 function upsertKinematicEntity(
   map: Map<string, KinematicAircraft>,
   frame: AircraftTelemetry,
@@ -93,6 +235,10 @@ function upsertKinematicEntity(
     const posChanged =
       Math.abs(frame.lat - existing.rawLat) > 1e-5 ||
       Math.abs(frame.lon - existing.rawLon) > 1e-5;
+    const searchChanged =
+      existing.callsign !== frame.callsign ||
+      existing.squawk !== frame.squawk ||
+      existing.origin_country !== frame.origin_country;
 
     existing.callsign = frame.callsign;
     existing.origin_country = frame.origin_country;
@@ -110,13 +256,22 @@ function upsertKinematicEntity(
     existing.fir = frame.fir;
     existing.source = frame.source;
     existing.server_timestamp = frame.server_timestamp;
-    existing.isHelicopter = Boolean(frame.isHelicopter) || isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model);
+    existing.isHelicopter =
+      Boolean(frame.isHelicopter) ||
+      isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model);
     if (frame.registration) existing.registration = frame.registration;
     if (frame.aircraft_code) existing.aircraft_code = frame.aircraft_code;
     if (frame.aircraft_model) existing.aircraft_model = frame.aircraft_model;
 
-    // Only update the Dead Reckoning anchor when the transponder actually reported a NEW coordinate!
-    // This prevents backward rubber-banding when cached/duplicate packets arrive.
+    if (searchChanged || !existing.searchKey) {
+      existing.searchKey = buildSearchKey(
+        frame.callsign,
+        frame.icao24,
+        frame.squawk,
+        frame.origin_country
+      );
+    }
+
     if (posChanged) {
       existing.rawLat = frame.lat;
       existing.rawLon = frame.lon;
@@ -134,10 +289,13 @@ function upsertKinematicEntity(
         nowMs
       );
     }
+    updatePrecomputedVelocity(existing);
   } else {
-    map.set(frame.icao24, {
+    const created: KinematicAircraft = {
       ...frame,
-      isHelicopter: Boolean(frame.isHelicopter) || isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model),
+      isHelicopter:
+        Boolean(frame.isHelicopter) ||
+        isHelicopterAirframe(frame.aircraft_code, frame.aircraft_model),
       rawLat: frame.lat,
       rawLon: frame.lon,
       anchorLat: frame.lat,
@@ -151,13 +309,56 @@ function upsertKinematicEntity(
       renderLon: frame.lon,
       renderAlt: frame.baro_altitude,
       renderTrack: frame.true_track,
-    });
+      searchKey: buildSearchKey(
+        frame.callsign,
+        frame.icao24,
+        frame.squawk,
+        frame.origin_country
+      ),
+    };
+    updatePrecomputedVelocity(created);
+    map.set(frame.icao24, created);
   }
+}
+
+function summarizeKinematicMap(
+  map: Map<string, KinematicAircraft>,
+  totalGlobalCount?: number
+): { categoryCounts: AircraftCategoryCounts; emergencyList: KinematicAircraft[] } {
+  let all = 0;
+  let planes = 0;
+  let helicopters = 0;
+  const emergencyList: KinematicAircraft[] = [];
+
+  for (const ac of map.values()) {
+    all++;
+    if (ac.isHelicopter === true) {
+      helicopters++;
+    } else {
+      planes++;
+    }
+    if (isEmergencySquawk(ac.squawk)) {
+      emergencyList.push(ac);
+    }
+  }
+
+  if (typeof totalGlobalCount === 'number' && totalGlobalCount > all) {
+    const delta = totalGlobalCount - all;
+    all += delta;
+    planes += delta;
+  }
+
+  return {
+    categoryCounts: { all, planes, helicopters },
+    emergencyList,
+  };
 }
 
 export const useFlightStore = create<FlightStoreState>((set, get) => ({
   kinematicMap: new Map<string, KinematicAircraft>(),
   batchVersion: 0,
+  categoryCounts: { all: 0, planes: 0, helicopters: 0 },
+  emergencyList: [],
 
   selectedIcao24: null,
   selectedAircraftSnapshot: null,
@@ -200,43 +401,16 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
     const nowMs = performance.now();
     const serverNow = Date.now();
     const normalizedSource: 'opensky' | 'adsbfi' | 'synthetic' =
-      source === 'opensky' ? 'opensky' : 'adsbfi';
+      source === 'opensky' ? 'opensky' : source === 'synthetic' ? 'synthetic' : 'adsbfi';
 
     for (let i = 0; i < removedIds.length; i++) {
       map.delete(removedIds[i]);
     }
 
-    // 1. Decode compact flat tuples [icao24, callsign, origin_country, lat, lon, ..., isHelicopter]
+    // 1. Decode compact flat tuples directly in-place without intermediate object allocations
     if (tuples && tuples.length > 0) {
       for (let i = 0; i < tuples.length; i++) {
-        const t = tuples[i];
-        upsertKinematicEntity(
-          map,
-          {
-            icao24: t[0],
-            callsign: t[1],
-            origin_country: t[2],
-            lat: t[3],
-            lon: t[4],
-            baro_altitude: t[5],
-            geo_altitude: t[6],
-            velocity: t[7],
-            true_track: t[8],
-            vertical_rate: t[9],
-            squawk: t[10],
-            on_ground: t[11] === 1,
-            last_contact: t[12],
-            geohash: t[13],
-            fir: t[14],
-            source: normalizedSource,
-            server_timestamp: serverNow,
-            registration: t[15] || undefined,
-            aircraft_code: t[16] || undefined,
-            aircraft_model: t[17] || undefined,
-            isHelicopter: Boolean(t[18]) || isHelicopterAirframe(t[16], t[17]),
-          },
-          nowMs
-        );
+        upsertCompactTuple(map, tuples[i], normalizedSource, serverNow, nowMs);
       }
     }
 
@@ -254,8 +428,12 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
         ? totalGlobalCount
         : map.size;
 
+    const { categoryCounts, emergencyList } = summarizeKinematicMap(map, trackedCount);
+
     set((state) => ({
       batchVersion: state.batchVersion + 1,
+      categoryCounts,
+      emergencyList,
       selectedAircraftSnapshot: selAc ? { ...selAc } : null,
       metrics: {
         ...state.metrics,
@@ -281,12 +459,19 @@ export const useFlightStore = create<FlightStoreState>((set, get) => ({
   },
 
   syncSelectedSnapshot: () => {
-    const selId = get().selectedIcao24;
-    if (!selId) return;
-    const ac = get().kinematicMap.get(selId);
-    if (ac) {
-      set({ selectedAircraftSnapshot: { ...ac } });
-    }
+    const state = get();
+    const map = state.kinematicMap;
+    const selId = state.selectedIcao24;
+    const ac = selId ? map.get(selId) : undefined;
+    const { categoryCounts, emergencyList } = summarizeKinematicMap(
+      map,
+      state.metrics.totalTrackedAircraft
+    );
+    set({
+      categoryCounts,
+      emergencyList,
+      ...(ac ? { selectedAircraftSnapshot: { ...ac } } : {}),
+    });
   },
 
   setSelectedTrail: (icao24, trail) => {

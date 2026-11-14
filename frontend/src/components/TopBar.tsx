@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Cpu,
   Globe,
@@ -24,7 +24,7 @@ const CATEGORY_FILTER_OPTIONS: Array<{
 export const TopBar: React.FC = () => {
   const wsConnected = useFlightStore((s) => s.wsConnected);
   const metrics = useFlightStore((s) => s.metrics);
-  const batchVersion = useFlightStore((s) => s.batchVersion);
+  const categoryCounts = useFlightStore((s) => s.categoryCounts);
   const filterType = useFlightStore((s) => s.filterType) || 'all';
   const setFilterType = useFlightStore((s) => s.setFilterType);
   const setActiveFIRFilter = useFlightStore((s) => s.setActiveFIRFilter);
@@ -33,31 +33,6 @@ export const TopBar: React.FC = () => {
   const flyTo = useFlightStore((s) => s.flyTo);
 
   const [activeView, setActiveView] = useState<'chile' | 'world'>('chile');
-
-  const categoryCounts = useMemo(() => {
-    void batchVersion;
-    const map = useFlightStore.getState().kinematicMap;
-    let all = 0;
-    let planes = 0;
-    let helicopters = 0;
-
-    for (const ac of map.values()) {
-      all++;
-      if (ac.isHelicopter === true) {
-        helicopters++;
-      } else {
-        planes++;
-      }
-    }
-
-    if (metrics.totalTrackedAircraft > all) {
-      const delta = metrics.totalTrackedAircraft - all;
-      all += delta;
-      planes += delta;
-    }
-
-    return { all, planes, helicopters };
-  }, [batchVersion, metrics.totalTrackedAircraft]);
 
   const activeTrafficCount =
     filterType === 'planes'

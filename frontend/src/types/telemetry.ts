@@ -80,6 +80,17 @@ export interface KinematicAircraft extends AircraftTelemetry {
   renderLon: number;
   renderAlt: number;
   renderTrack: number;
+
+  // Precomputed per-batch geodesic velocity components (deg/sec) and lowercase search index
+  degLatPerSec?: number;
+  degLonPerSec?: number;
+  searchKey?: string;
+}
+
+export interface AircraftCategoryCounts {
+  all: number;
+  planes: number;
+  helicopters: number;
 }
 
 export interface FIRDefinition {

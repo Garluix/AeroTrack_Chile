@@ -1,8 +1,6 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import { AlertOctagon } from 'lucide-react';
 import { useFlightStore } from '../store/useFlightStore';
-import { KinematicAircraft } from '../types/telemetry';
-import { isEmergencySquawk } from '../utils/kinematics';
 import { TopBar } from './TopBar';
 
 interface TelemetryOverlayProps {
@@ -12,21 +10,9 @@ interface TelemetryOverlayProps {
 export const TelemetryOverlay: React.FC<TelemetryOverlayProps> = ({
   onTriggerDemoEmergency,
 }) => {
-  const batchVersion = useFlightStore((s) => s.batchVersion);
+  const emergencyList = useFlightStore((s) => s.emergencyList);
   const flyTo = useFlightStore((s) => s.flyTo);
   const setSelectedIcao24 = useFlightStore((s) => s.setSelectedIcao24);
-
-  const emergencyList = useMemo(() => {
-    void batchVersion;
-    const map = useFlightStore.getState().kinematicMap;
-    const alerts: KinematicAircraft[] = [];
-    for (const ac of map.values()) {
-      if (isEmergencySquawk(ac.squawk)) {
-        alerts.push(ac);
-      }
-    }
-    return alerts;
-  }, [batchVersion]);
 
   return (
     <div className="fixed top-3 left-3 right-3 z-20 pointer-events-none flex flex-col items-start gap-2.5">
